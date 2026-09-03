@@ -1,0 +1,602 @@
+{
+  "_purpose": "Sample user queries for the /chat harness, derived directly from the real cybersierra CLI's manifest (cybersierra manifest --raw), not invented independently. Each single_command_query maps to exactly one manifest command; composite_queries require the Planner to chain 2+ commands per skills/cyber-sierra/_internal/planner/references/planning-rules.md; adversarial_queries have no matching manifest command and should be rejected, per that same file's 'No hallucinated commands' rule. Read-only (safe:true) commands only -- write/safe:false commands were removed on purpose (see dataset/README.md 'Write operations were removed') so running this dataset never creates, sends, submits, or updates real data in whatever cybersierra backend it's pointed at. See dataset/README.md for how this was generated and how to use it.",
+  "generated_from": {
+    "cli": "cybersierra",
+    "manifest_version": "367f09699890",
+    "captured_via": "cybersierra manifest --raw / cybersierra manifest",
+    "captured_at": "2026-09-03",
+    "total_commands_in_manifest": 37,
+    "note": "The manifest changed between this repo's initial build and this dataset's capture (notifications module and several tprm resources -- activity-logs, assessee-scans, assessee-tenant-users -- were added by a self-update in between). This dataset is a snapshot; see verify/validate_query_dataset.py for drift detection against whatever manifest is live when you run it."
+  },
+  "single_command_queries": [
+    {
+      "id": "health-status-get",
+      "module": "health",
+      "resource": "status",
+      "action": "get",
+      "command": "health status get",
+      "safe": true,
+      "description": "Backend liveness check",
+      "required_params": [],
+      "example_queries": [
+        "Is the Cyber Sierra backend up right now?",
+        "Check system health."
+      ]
+    },
+    {
+      "id": "notifications-feed-list",
+      "module": "notifications",
+      "resource": "feed",
+      "action": "list",
+      "command": "notifications feed list",
+      "safe": true,
+      "description": "List in-app notifications for the caller (filters/paging via --data)",
+      "required_params": [],
+      "example_queries": [
+        "Show me my notifications from the last week.",
+        "List all my assessment-related notifications since May 2026."
+      ],
+      "notes": "Manifest description explicitly warns paging defaults to 10 rows and is a nested {page,limit} object under --data -- worth an example where the Executor/Planner needs to set an explicit limit."
+    },
+    {
+      "id": "notifications-feed-unread-count",
+      "module": "notifications",
+      "resource": "feed",
+      "action": "unread-count",
+      "command": "notifications feed unread-count",
+      "safe": true,
+      "description": "Unread notification count for the caller",
+      "required_params": [],
+      "example_queries": [
+        "How many unread notifications do I have?"
+      ]
+    },
+    {
+      "id": "permissions-policies-list",
+      "module": "permissions",
+      "resource": "policies",
+      "action": "list",
+      "command": "permissions policies list",
+      "safe": true,
+      "description": "List permission policies",
+      "required_params": [
+        "subject"
+      ],
+      "example_queries": [
+        "What permission policies apply to user U123?",
+        "Show me the access policies for the auditor role subject."
+      ],
+      "notes": "subject is required and not obviously a userId or a role name from the description alone -- a good case for the Executor's {{inputs.*}} collection step (contracts.md: 'Collects any unresolved {{inputs.*}} values from the user')."
+    },
+    {
+      "id": "tprm-activity-logs-filter-options",
+      "module": "tprm",
+      "resource": "activity-logs",
+      "action": "filter-options",
+      "command": "tprm activity-logs filter-options",
+      "safe": true,
+      "description": "Valid filter values for activity logs (actors, object types)",
+      "required_params": [
+        "objectType",
+        "objectId"
+      ],
+      "example_queries": [
+        "What filter options are available for activity logs on assessee A123?"
+      ],
+      "notes": "objectType is an enum (assessee/document/comment) -- a plausible case for the model to get wrong without reading the manifest params carefully."
+    },
+    {
+      "id": "tprm-activity-logs-list",
+      "module": "tprm",
+      "resource": "activity-logs",
+      "action": "list",
+      "command": "tprm activity-logs list",
+      "safe": true,
+      "description": "List assessee/assessment/document activity (filters/paging via --data)",
+      "required_params": [],
+      "example_queries": [
+        "Show me all activity on the Acme Corp assessee since May 2026.",
+        "What actions has user U123 taken this month?"
+      ]
+    },
+    {
+      "id": "tprm-assessee-drafts-list",
+      "module": "tprm",
+      "resource": "assessee-drafts",
+      "action": "list",
+      "command": "tprm assessee-drafts list",
+      "safe": true,
+      "description": "List draft assessees",
+      "required_params": [
+        "limit",
+        "page"
+      ],
+      "example_queries": [
+        "List all draft vendors I haven't finished creating yet.",
+        "Show me the vendor drafts still in progress."
+      ]
+    },
+    {
+      "id": "tprm-assessee-scans-list",
+      "module": "tprm",
+      "resource": "assessee-scans",
+      "action": "list",
+      "command": "tprm assessee-scans list",
+      "safe": true,
+      "description": "List security scans for an assessee",
+      "required_params": [
+        "page",
+        "limit",
+        "id"
+      ],
+      "example_queries": [
+        "Show me the security scan results for vendor A123.",
+        "What security scans have run against Acme Corp?"
+      ]
+    },
+    {
+      "id": "tprm-assessee-tenant-users-list",
+      "module": "tprm",
+      "resource": "assessee-tenant-users",
+      "action": "list",
+      "command": "tprm assessee-tenant-users list",
+      "safe": true,
+      "description": "List the users belonging to an assessee tenant",
+      "required_params": [
+        "assesseeId"
+      ],
+      "example_queries": [
+        "Who are the users at Acme Corp's organization?"
+      ]
+    },
+    {
+      "id": "tprm-assessee-versions-list",
+      "module": "tprm",
+      "resource": "assessee-versions",
+      "action": "list",
+      "command": "tprm assessee-versions list",
+      "safe": true,
+      "description": "List assessee versions",
+      "required_params": [
+        "limit",
+        "page"
+      ],
+      "example_queries": [
+        "Show me the version history for our vendor records."
+      ]
+    },
+    {
+      "id": "tprm-assessees-comments",
+      "module": "tprm",
+      "resource": "assessees",
+      "action": "comments",
+      "command": "tprm assessees comments",
+      "safe": true,
+      "description": "List comments on an assessee",
+      "required_params": [
+        "id"
+      ],
+      "example_queries": [
+        "What comments have been left on Acme Corp's profile?"
+      ]
+    },
+    {
+      "id": "tprm-assessees-count",
+      "module": "tprm",
+      "resource": "assessees",
+      "action": "count",
+      "command": "tprm assessees count",
+      "safe": true,
+      "description": "Count assessees in the tenant",
+      "required_params": [],
+      "example_queries": [
+        "How many vendors do we have in total?",
+        "Give me a total assessee count."
+      ]
+    },
+    {
+      "id": "tprm-assessees-get",
+      "module": "tprm",
+      "resource": "assessees",
+      "action": "get",
+      "command": "tprm assessees get",
+      "safe": true,
+      "description": "Get the detail of a single assessee",
+      "required_params": [
+        "id"
+      ],
+      "example_queries": [
+        "Show me the full profile for vendor A123."
+      ]
+    },
+    {
+      "id": "tprm-assessees-list",
+      "module": "tprm",
+      "resource": "assessees",
+      "action": "list",
+      "command": "tprm assessees list",
+      "safe": true,
+      "description": "List assessees (optional filters via --data)",
+      "required_params": [],
+      "example_queries": [
+        "List all our vendors.",
+        "Show me the first 20 assessees."
+      ]
+    },
+    {
+      "id": "tprm-assessment-drafts-get",
+      "module": "tprm",
+      "resource": "assessment-drafts",
+      "action": "get",
+      "command": "tprm assessment-drafts get",
+      "safe": true,
+      "description": "Get the detail of an assessment draft",
+      "required_params": [
+        "id"
+      ],
+      "example_queries": [
+        "Show me draft assessment D456."
+      ]
+    },
+    {
+      "id": "tprm-assessment-drafts-list",
+      "module": "tprm",
+      "resource": "assessment-drafts",
+      "action": "list",
+      "command": "tprm assessment-drafts list",
+      "safe": true,
+      "description": "List assessment drafts",
+      "required_params": [],
+      "example_queries": [
+        "What assessment drafts do we have in progress?"
+      ]
+    },
+    {
+      "id": "tprm-assessment-questions-get",
+      "module": "tprm",
+      "resource": "assessment-questions",
+      "action": "get",
+      "command": "tprm assessment-questions get",
+      "safe": true,
+      "description": "Get the detail of a single assessment question",
+      "required_params": [
+        "questionId",
+        "assessmentId",
+        "fileId"
+      ],
+      "example_queries": [
+        "Show me question Q5 from assessment A123, file F1."
+      ],
+      "notes": "Three required params, including fileId -- a good stress test for the Executor collecting multiple {{inputs.*}} values before running one step."
+    },
+    {
+      "id": "tprm-assessment-templates-get",
+      "module": "tprm",
+      "resource": "assessment-templates",
+      "action": "get",
+      "command": "tprm assessment-templates get",
+      "safe": true,
+      "description": "Get the detail of an assessment template",
+      "required_params": [
+        "id"
+      ],
+      "example_queries": [
+        "Show me the details of the SOC 2 assessment template."
+      ]
+    },
+    {
+      "id": "tprm-assessment-templates-list",
+      "module": "tprm",
+      "resource": "assessment-templates",
+      "action": "list",
+      "command": "tprm assessment-templates list",
+      "safe": true,
+      "description": "List assessment templates",
+      "required_params": [],
+      "example_queries": [
+        "What assessment templates are available?"
+      ]
+    },
+    {
+      "id": "tprm-assessments-comments",
+      "module": "tprm",
+      "resource": "assessments",
+      "action": "comments",
+      "command": "tprm assessments comments",
+      "safe": true,
+      "description": "List comments on an assessment",
+      "required_params": [
+        "keyword",
+        "id"
+      ],
+      "example_queries": [
+        "What comments are on assessment A123?"
+      ]
+    },
+    {
+      "id": "tprm-assessments-comparison",
+      "module": "tprm",
+      "resource": "assessments",
+      "action": "comparison",
+      "command": "tprm assessments comparison",
+      "safe": true,
+      "description": "Compare multiple assessments side by side",
+      "required_params": [
+        "ids"
+      ],
+      "example_queries": [
+        "Compare assessments A123 and A124 side by side."
+      ]
+    },
+    {
+      "id": "tprm-assessments-get",
+      "module": "tprm",
+      "resource": "assessments",
+      "action": "get",
+      "command": "tprm assessments get",
+      "safe": true,
+      "description": "Get the full detail of a single assessment by ID",
+      "required_params": [
+        "submissionType",
+        "sort",
+        "limit",
+        "page",
+        "id"
+      ],
+      "example_queries": [
+        "Show me full details for assessment A123."
+      ]
+    },
+    {
+      "id": "tprm-assessments-list",
+      "module": "tprm",
+      "resource": "assessments",
+      "action": "list",
+      "command": "tprm assessments list",
+      "safe": true,
+      "description": "List third-party risk assessments visible to you",
+      "required_params": [
+        "submissionType",
+        "sort",
+        "limit",
+        "page"
+      ],
+      "example_queries": [
+        "List all pending vendor risk assessments.",
+        "Show me overdue assessments assigned to me.",
+        "List assessments sent to Acme Corp this quarter."
+      ]
+    },
+    {
+      "id": "tprm-assessments-verification",
+      "module": "tprm",
+      "resource": "assessments",
+      "action": "verification",
+      "command": "tprm assessments verification",
+      "safe": true,
+      "description": "Get verification detail (verified questions) for an assessment",
+      "required_params": [
+        "submissionType",
+        "sort",
+        "limit",
+        "page",
+        "id"
+      ],
+      "example_queries": [
+        "Show me which questions were verified for assessment A123."
+      ]
+    },
+    {
+      "id": "tprm-dashboard-get",
+      "module": "tprm",
+      "resource": "dashboard",
+      "action": "get",
+      "command": "tprm dashboard get",
+      "safe": true,
+      "description": "Get the assessments dashboard data",
+      "required_params": [],
+      "example_queries": [
+        "Show me the vendor risk dashboard.",
+        "Give me an overview of our compliance posture."
+      ]
+    },
+    {
+      "id": "tprm-dashboard-charts-list",
+      "module": "tprm",
+      "resource": "dashboard-charts",
+      "action": "list",
+      "command": "tprm dashboard-charts list",
+      "safe": true,
+      "description": "List saved public assessment charts",
+      "required_params": [
+        "fetchData"
+      ],
+      "example_queries": [
+        "What saved dashboard charts do we have, with their data?"
+      ]
+    },
+    {
+      "id": "tprm-dashboard-charts-metadata",
+      "module": "tprm",
+      "resource": "dashboard-charts",
+      "action": "metadata",
+      "command": "tprm dashboard-charts metadata",
+      "safe": true,
+      "description": "Chart metadata -- columns and table relationships available for charting",
+      "required_params": [],
+      "example_queries": [
+        "What fields are available for building a custom compliance chart?"
+      ]
+    },
+    {
+      "id": "tprm-risk-score-config-get-org",
+      "module": "tprm",
+      "resource": "risk-score-config",
+      "action": "get-org",
+      "command": "tprm risk-score-config get-org",
+      "safe": true,
+      "description": "Get organization-level risk score configuration",
+      "required_params": [],
+      "example_queries": [
+        "What's our current organization-level risk scoring configuration?"
+      ]
+    },
+    {
+      "id": "tprm-vendor-info-get",
+      "module": "tprm",
+      "resource": "vendor-info",
+      "action": "get",
+      "command": "tprm vendor-info get",
+      "safe": true,
+      "description": "Get vendor info for the current user",
+      "required_params": [],
+      "example_queries": [
+        "Show me vendor info for my account."
+      ]
+    },
+    {
+      "id": "user-management-me-get",
+      "module": "user-management",
+      "resource": "me",
+      "action": "get",
+      "command": "user-management me get",
+      "safe": true,
+      "description": "Identity and tenant context of the authenticated caller",
+      "required_params": [],
+      "example_queries": [
+        "Who am I logged in as?",
+        "What's my role and tenant?"
+      ]
+    },
+    {
+      "id": "user-management-user-groups-list",
+      "module": "user-management",
+      "resource": "user-groups",
+      "action": "list",
+      "command": "user-management user-groups list",
+      "safe": true,
+      "description": "List user groups in your tenant (paginated, searchable by name)",
+      "required_params": [],
+      "example_queries": [
+        "What user groups exist in our organization?",
+        "Search for a user group called Auditors."
+      ]
+    },
+    {
+      "id": "user-management-users-list",
+      "module": "user-management",
+      "resource": "users",
+      "action": "list",
+      "command": "user-management users list",
+      "safe": true,
+      "description": "List users in your tenant (userId, email, name, roles)",
+      "required_params": [],
+      "example_queries": [
+        "List all users in our tenant.",
+        "Find the user ID for jane@acme.com."
+      ]
+    }
+  ],
+  "composite_queries": [
+    {
+      "id": "composite-snapshot",
+      "example_query": "Give me a quick compliance snapshot: how many vendors do we have, and what's on the risk dashboard?",
+      "expected_commands": [
+        "tprm assessees count",
+        "tprm dashboard get"
+      ],
+      "notes": "No data dependency between the two steps -- tests that the Planner can produce two independent, parallel-eligible (but still linearly executed, per execution-plan-schema.md's 'strictly linear') steps from one request."
+    },
+    {
+      "id": "composite-identity-and-notifications",
+      "example_query": "Who am I, and how many unread notifications do I have?",
+      "expected_commands": [
+        "user-management me get",
+        "notifications feed unread-count"
+      ]
+    },
+    {
+      "id": "composite-vendor-then-detail",
+      "example_query": "List our vendors, then show me the full details of the first one.",
+      "expected_commands": [
+        "tprm assessees list",
+        "tprm assessees get"
+      ],
+      "notes": "Step 2's id argument should be a {{step[1].*}} reference into step 1's list output -- the canonical case execution-plan-schema.md's Reference Syntax exists for."
+    },
+    {
+      "id": "composite-compare-recent",
+      "example_query": "Find the assessments we've sent to Acme Corp and compare the two most recent ones.",
+      "expected_commands": [
+        "tprm assessments list",
+        "tprm assessments comparison"
+      ],
+      "notes": "Step 2's ids argument depends on step 1's results ({{step[1].*}}), and also requires the model to do non-plan reasoning (picking 'the two most recent') on the returned data -- planning-rules.md is explicit that analysis like this is the agent's job post-execution, not a plan step."
+    },
+    {
+      "id": "composite-identity-and-groups",
+      "example_query": "Show me my identity, then list the user groups in my tenant.",
+      "expected_commands": [
+        "user-management me get",
+        "user-management user-groups list"
+      ]
+    },
+    {
+      "id": "composite-draft-vs-total",
+      "example_query": "List our draft assessees and also tell me the total assessee count, so I know how many are still in draft.",
+      "expected_commands": [
+        "tprm assessee-drafts list",
+        "tprm assessees count"
+      ]
+    },
+    {
+      "id": "composite-template-then-detail",
+      "example_query": "What assessment templates exist, and show me the full detail of the SOC 2 one.",
+      "expected_commands": [
+        "tprm assessment-templates list",
+        "tprm assessment-templates get"
+      ],
+      "notes": "Step 2's id must be resolved from step 1's list by matching on name/description -- there's no direct 'get by name' command, so this also tests whether the Planner correctly treats the SOC 2 template's id as a {{step[1].*}} reference rather than inventing an id."
+    },
+    {
+      "id": "composite-activity-filters-then-log",
+      "example_query": "What filter options are available for activity logs on assessee A123, and then show me its actual activity log?",
+      "expected_commands": [
+        "tprm activity-logs filter-options",
+        "tprm activity-logs list"
+      ]
+    }
+  ],
+  "adversarial_queries": [
+    {
+      "id": "adversarial-email-report",
+      "example_query": "Email the latest vendor risk report to our CFO.",
+      "expected_behavior": "reject",
+      "reason": "No email/report-delivery command exists anywhere in the manifest. Per planning-rules.md's rejection criteria, this should be rejected outright, not approximated with a partial plan."
+    },
+    {
+      "id": "adversarial-delete-vendor",
+      "example_query": "Delete vendor Acme Corp entirely from our system.",
+      "expected_behavior": "reject",
+      "reason": "tprm assessees only has create/get/list/count/comments -- no delete action exists in the manifest at all."
+    },
+    {
+      "id": "adversarial-bulk-approve",
+      "example_query": "Auto-approve every pending assessment without me reviewing them.",
+      "expected_behavior": "reject",
+      "reason": "No bulk-approve action exists, and this also requires conditional/branching logic ('every pending one') that planning-rules.md's Hard Rules explicitly forbid ('No branching. Plans are linear sequences.')."
+    },
+    {
+      "id": "adversarial-unrelated",
+      "example_query": "What's the weather like in Bangalore today?",
+      "expected_behavior": "reject",
+      "reason": "Completely outside the cybersierra domain -- no module in the manifest is even plausibly relevant. Correct behavior is answering from general knowledge or declining, never attempting a cybersierra command."
+    },
+    {
+      "id": "adversarial-scheduled-report",
+      "example_query": "Set up a recurring monthly vendor risk report emailed to the board.",
+      "expected_behavior": "reject",
+      "reason": "No scheduling, reporting-generation, or email capability exists in the manifest. Also implicitly asks for ongoing/background behavior this one-shot CLI-driven pipeline has no mechanism for."
+    }
+  ]
+}

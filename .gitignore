@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+
+# dataset/run_dataset.py's output -- real run results (may include real
+# tenant/vendor data from your cybersierra backend), not the dataset itself
+dataset/results.json
+dataset/results/

@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cybersierra chat (DeepAgents POC)</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #f7f7f8; color: #111;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1a1a1a; color: #eee; }
+    #log { background: #242424 !important; border-color: #3a3a3a !important; }
+    .msg.assistant { background: #2d2d2d !important; }
+    input, textarea { background: #2d2d2d !important; color: #eee !important; border-color: #444 !important; }
+  }
+  header {
+    padding: 10px 16px; border-bottom: 1px solid rgba(127,127,127,.3);
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  }
+  header strong { font-size: 14px; }
+  header input {
+    flex: 1; min-width: 180px; padding: 6px 8px; border: 1px solid rgba(127,127,127,.4);
+    border-radius: 6px; font: inherit;
+  }
+  #session-badge {
+    font-size: 11px; opacity: .6; font-family: ui-monospace, monospace;
+    white-space: nowrap;
+  }
+  #log {
+    flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px;
+    background: #fff; border-top: 1px solid rgba(127,127,127,.15);
+  }
+  .msg { max-width: 720px; padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: #d6e6ff; }
+  .msg.assistant { align-self: flex-start; background: #f0f0f2; }
+  .msg.assistant.streaming { font-family: ui-monospace, monospace; font-size: 13px; opacity: .85; }
+  .msg.assistant.rendered p:first-child { margin-top: 0; }
+  .msg.assistant.rendered p:last-child { margin-bottom: 0; }
+  .msg.assistant.rendered pre { background: rgba(127,127,127,.15); padding: 8px; border-radius: 6px; overflow-x: auto; }
+  .msg.assistant.rendered code { font-family: ui-monospace, monospace; }
+  .msg.error { align-self: center; background: #ffdcdc; color: #7a0000; }
+  form {
+    display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid rgba(127,127,127,.3);
+  }
+  form textarea {
+    flex: 1; resize: none; padding: 8px 10px; border: 1px solid rgba(127,127,127,.4);
+    border-radius: 8px; font: inherit; height: 40px;
+  }
+  form button {
+    padding: 0 18px; border: none; border-radius: 8px; background: #2563eb; color: #fff;
+    font: inherit; cursor: pointer;
+  }
+  form button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+
+<header>
+  <strong>cybersierra chat</strong>
+  <input id="token" type="password" placeholder="access_token (optional — cybersierra CLI is already authenticated; kept in-memory only, never persisted)" autocomplete="off">
+  <span id="session-badge">no session yet</span>
+</header>
+
+<div id="log"></div>
+
+<form id="form">
+  <textarea id="input" placeholder="Ask something…" autocomplete="off"></textarea>
+  <button type="submit" id="send">Send</button>
+</form>
+
+<script>
+// Talks to POST /chat (this same origin). That endpoint streams
+// Server-Sent Events: `session`, `delta`, `tool_use`, `done`, `error` —
+// see server/app.py. This page deliberately only ever shows `delta` text
+// while it's arriving (as a live, monospace "typing" view) and the final
+// assembled answer rendered as Markdown once `done` fires. `tool_use`
+// events (which tool the agent is calling mid-turn) are intentionally
+// never rendered here — this is a chat UI, not a debug console, so the
+// model's tool-use steps stay out of the transcript the user sees. Look at
+// the browser console if you want to see them anyway.
+
+let sessionId = null;
+
+const log = document.getElementById("log");
+const form = document.getElementById("form");
+const input = document.getElementById("input");
+const tokenInput = document.getElementById("token");
+const sendBtn = document.getElementById("send");
+const sessionBadge = document.getElementById("session-badge");
+
+function addMessage(role, text) {
+  const el = document.createElement("div");
+  el.className = `msg ${role}`;
+  el.textContent = text;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+function addAssistantStreamingBubble() {
+  const el = document.createElement("div");
+  el.className = "msg assistant streaming";
+  el.textContent = "";
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+// Minimal SSE parser over a fetch() body stream. Not EventSource because
+// EventSource can't send a POST body (message/session_id/access_token
+// have to go out as one multipart form, per server/app.py's Form fields).
+async function* parseSSE(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let sep;
+    while ((sep = buffer.indexOf("\n\n")) !== -1) {
+      const block = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      let event = "message";
+      let data = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      if (data) yield { event, data: JSON.parse(data) };
+    }
+  }
+}
+
+async function send(message, accessToken) {
+  addMessage("user", message);
+  const streamingEl = addAssistantStreamingBubble();
+  let fullText = "";
+
+  const body = new FormData();
+  body.set("message", message);
+  body.set("access_token", accessToken);
+  if (sessionId) body.set("session_id", sessionId);
+
+  let response;
+  try {
+    response = await fetch("/chat", { method: "POST", body });
+  } catch (err) {
+    streamingEl.remove();
+    addMessage("error", `network error: ${err.message}`);
+    return;
+  }
+
+  if (!response.ok) {
+    const errBody = await response.json().catch(() => null);
+    streamingEl.remove();
+    const msg = errBody?.error?.message ?? `HTTP ${response.status}`;
+    addMessage("error", msg);
+    return;
+  }
+
+  for await (const { event, data } of parseSSE(response)) {
+    if (event === "session") {
+      sessionId = data.session_id;
+      sessionBadge.textContent = `session: ${sessionId}`;
+    } else if (event === "delta") {
+      fullText += data.text;
+      streamingEl.textContent = fullText;
+      log.scrollTop = log.scrollHeight;
+    } else if (event === "tool_use") {
+      console.log("tool_use:", data.name);
+    } else if (event === "done") {
+      streamingEl.classList.remove("streaming");
+      streamingEl.classList.add("rendered");
+      streamingEl.innerHTML = marked.parse(fullText);
+      console.log("done:", data);
+    } else if (event === "error") {
+      streamingEl.remove();
+      addMessage("error", data.message ?? data.code);
+    }
+  }
+}
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const message = input.value.trim();
+  // Optional, not required — the real cybersierra CLI already holds its
+  // own auth (a persisted profile from a one-time `cybersierra auth
+  // login-browser`), so there's no per-request credential this POC needs
+  // from you here. Fill it in only to exercise
+  // CYBERSIERRA_INJECT_ACCESS_TOKEN=1 mode with a real per-user token —
+  // see README "Authentication model".
+  const accessToken = tokenInput.value.trim();
+  if (!message) return;
+  input.value = "";
+  sendBtn.disabled = true;
+  try {
+    await send(message, accessToken);
+  } finally {
+    sendBtn.disabled = false;
+    input.focus();
+  }
+});
+
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    form.requestSubmit();
+  }
+});
+</script>
+
+</body>
+</html>

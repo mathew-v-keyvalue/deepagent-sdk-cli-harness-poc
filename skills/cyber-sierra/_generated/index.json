@@ -1,0 +1,4 @@
+{
+  "_purpose": "Skill discovery index. The Router reads this to match requests against learned skills without loading every SKILL.md into context. Append new entries when a skill is learned. Do not rewrite existing entries.",
+  "skills": []
+}
