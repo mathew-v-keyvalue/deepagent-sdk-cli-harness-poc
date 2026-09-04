@@ -19,7 +19,7 @@ import os
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 
-DEFAULT_MODEL = "anthropic:claude-sonnet-4-6"
+DEFAULT_MODEL = "openai:gpt-5.1"
 
 _REQUIRED_KEY_BY_PROVIDER = {
     "anthropic": "ANTHROPIC_API_KEY",

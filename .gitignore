@@ -10,3 +10,8 @@ build/
 # tenant/vendor data from your cybersierra backend), not the dataset itself
 dataset/results.json
 dataset/results/
+
+# harness/observability.py's rotating log file -- runtime output, not
+# something to commit (also may contain real CLI output/tenant data,
+# though access_token is scrubbed -- see harness/sandbox.py's scrub())
+logs/

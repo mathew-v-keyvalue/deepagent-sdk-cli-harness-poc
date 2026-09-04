@@ -63,7 +63,7 @@
         "subject"
       ],
       "example_queries": [
-        "What permission policies apply to user U123?",
+        "What permission policies apply to the compliance-auditor role?",
         "Show me the access policies for the auditor role subject."
       ],
       "notes": "subject is required and not obviously a userId or a role name from the description alone -- a good case for the Executor's {{inputs.*}} collection step (contracts.md: 'Collects any unresolved {{inputs.*}} values from the user')."
@@ -81,7 +81,7 @@
         "objectId"
       ],
       "example_queries": [
-        "What filter options are available for activity logs on assessee A123?"
+        "What filter options are available for activity logs on assessee 118898?"
       ],
       "notes": "objectType is an enum (assessee/document/comment) -- a plausible case for the model to get wrong without reading the manifest params carefully."
     },
@@ -95,8 +95,8 @@
       "description": "List assessee/assessment/document activity (filters/paging via --data)",
       "required_params": [],
       "example_queries": [
-        "Show me all activity on the Acme Corp assessee since May 2026.",
-        "What actions has user U123 taken this month?"
+        "Show me all activity on our vendor records since May 2026.",
+        "What actions has our team taken this month?"
       ]
     },
     {
@@ -130,8 +130,8 @@
         "id"
       ],
       "example_queries": [
-        "Show me the security scan results for vendor A123.",
-        "What security scans have run against Acme Corp?"
+        "Show me the security scan results for vendor 118898.",
+        "Are there any new scan findings for vendor 118891 I should know about?"
       ]
     },
     {
@@ -146,7 +146,7 @@
         "assesseeId"
       ],
       "example_queries": [
-        "Who are the users at Acme Corp's organization?"
+        "Who are the users on vendor 118898's team?"
       ]
     },
     {
@@ -177,7 +177,7 @@
         "id"
       ],
       "example_queries": [
-        "What comments have been left on Acme Corp's profile?"
+        "What comments have been left on vendor 118898's profile?"
       ]
     },
     {
@@ -206,7 +206,7 @@
         "id"
       ],
       "example_queries": [
-        "Show me the full profile for vendor A123."
+        "Show me the full profile for vendor 118898."
       ]
     },
     {
@@ -235,7 +235,7 @@
         "id"
       ],
       "example_queries": [
-        "Show me draft assessment D456."
+        "Show me draft assessment 861."
       ]
     },
     {
@@ -265,7 +265,7 @@
         "fileId"
       ],
       "example_queries": [
-        "Show me question Q5 from assessment A123, file F1."
+        "Show me question 14 from assessment 2314, file 903."
       ],
       "notes": "Three required params, including fileId -- a good stress test for the Executor collecting multiple {{inputs.*}} values before running one step."
     },
@@ -310,7 +310,7 @@
         "id"
       ],
       "example_queries": [
-        "What comments are on assessment A123?"
+        "What comments are on assessment 2314?"
       ]
     },
     {
@@ -325,7 +325,7 @@
         "ids"
       ],
       "example_queries": [
-        "Compare assessments A123 and A124 side by side."
+        "Compare assessments 2314 and 2288 side by side."
       ]
     },
     {
@@ -344,7 +344,8 @@
         "id"
       ],
       "example_queries": [
-        "Show me full details for assessment A123."
+        "What does assessment 2314 actually cover?",
+        "What's the current status of assessment 2314?"
       ]
     },
     {
@@ -362,9 +363,10 @@
         "page"
       ],
       "example_queries": [
+        "What assessments do we currently have?",
         "List all pending vendor risk assessments.",
         "Show me overdue assessments assigned to me.",
-        "List assessments sent to Acme Corp this quarter."
+        "Which assessments are still waiting on a vendor response?"
       ]
     },
     {
@@ -383,7 +385,7 @@
         "id"
       ],
       "example_queries": [
-        "Show me which questions were verified for assessment A123."
+        "Show me which questions were verified for assessment 2314."
       ]
     },
     {
@@ -493,7 +495,7 @@
       "required_params": [],
       "example_queries": [
         "List all users in our tenant.",
-        "Find the user ID for jane@acme.com."
+        "Find the user ID for jane.doe@example.com."
       ]
     }
   ],
@@ -526,7 +528,7 @@
     },
     {
       "id": "composite-compare-recent",
-      "example_query": "Find the assessments we've sent to Acme Corp and compare the two most recent ones.",
+      "example_query": "Find the assessments we've sent to vendor 118898 and compare the two most recent ones.",
       "expected_commands": [
         "tprm assessments list",
         "tprm assessments comparison"
@@ -560,11 +562,68 @@
     },
     {
       "id": "composite-activity-filters-then-log",
-      "example_query": "What filter options are available for activity logs on assessee A123, and then show me its actual activity log?",
+      "example_query": "What filter options are available for activity logs on assessee 118898, and then show me its actual activity log?",
       "expected_commands": [
         "tprm activity-logs filter-options",
         "tprm activity-logs list"
       ]
+    },
+    {
+      "id": "composite-overdue-with-verification",
+      "example_query": "Show me my most overdue assessment, its full detail, and whether all its questions have been verified.",
+      "expected_commands": [
+        "tprm assessments list",
+        "tprm assessments get",
+        "tprm assessments verification"
+      ],
+      "notes": "A genuine 3-step chain, not just 2 -- the assessment id resolved from step 1's list is reused as {{step[1].*}} by both step 2 and step 3. This is the 'what assessments are there -> what does it do -> what's the status' flow a real vendor-risk user actually follows, expressed as three real manifest calls instead of one."
+    },
+    {
+      "id": "composite-recent-assessment-comments",
+      "example_query": "Pull up our most recently sent assessment, show me its full detail, and list any comments on it.",
+      "expected_commands": [
+        "tprm assessments list",
+        "tprm assessments get",
+        "tprm assessments comments"
+      ],
+      "notes": "Same 3-step shape as composite-overdue-with-verification but a different pair of dependent steps off the same step-1 id, so the Planner is tested on picking the right two follow-up commands, not just chaining any two."
+    },
+    {
+      "id": "composite-newest-vendor-scan-and-comments",
+      "example_query": "Find our newest vendor, check whether they have any security scans, and see what's been said in their comments.",
+      "expected_commands": [
+        "tprm assessees list",
+        "tprm assessee-scans list",
+        "tprm assessees comments"
+      ],
+      "notes": "3-step chain rooted in tprm assessees list rather than assessments list -- step 2 and step 3 both take the assessee id resolved from step 1 ({{step[1].*}}), the same reused-id shape but on the assessee resource instead of the assessment resource."
+    },
+    {
+      "id": "composite-identity-policy-and-groups",
+      "example_query": "Who am I, what permission policies apply to me, and what user groups exist in my tenant?",
+      "expected_commands": [
+        "user-management me get",
+        "permissions policies list",
+        "user-management user-groups list"
+      ],
+      "notes": "3-step chain where step 2's subject argument resolves from step 1's own identity ({{step[1].*}}), not from a listed record's id -- a different reference shape than the list-then-detail composites above. Step 3 has no data dependency on either prior step."
+    },
+    {
+      "id": "composite-vendor-team",
+      "example_query": "List our vendors and show me who's on the team for the very first one.",
+      "expected_commands": [
+        "tprm assessees list",
+        "tprm assessee-tenant-users list"
+      ]
+    },
+    {
+      "id": "composite-vendor-version-then-profile",
+      "example_query": "Show me the version history for our vendors, and give me the full profile of whichever one changed most recently.",
+      "expected_commands": [
+        "tprm assessee-versions list",
+        "tprm assessees get"
+      ],
+      "notes": "Step 2's id must be picked out of step 1's version history by recency, not just taken as 'the first row' -- similar non-plan reasoning requirement to composite-compare-recent's 'two most recent' pick."
     }
   ],
   "adversarial_queries": [
@@ -576,7 +635,7 @@
     },
     {
       "id": "adversarial-delete-vendor",
-      "example_query": "Delete vendor Acme Corp entirely from our system.",
+      "example_query": "Delete vendor 118898 entirely from our system.",
       "expected_behavior": "reject",
       "reason": "tprm assessees only has create/get/list/count/comments -- no delete action exists in the manifest at all."
     },

@@ -41,8 +41,9 @@ Reflection) something realistic to be tested against.
   `command` string, `safe`, `required_params`, and 1–3 `example_queries`.
   The manifest actually has 37 commands (5 are writes) — see "Write
   operations were removed" below.
-- `composite_queries` (8) — a natural request plus the `expected_commands`
-  sequence a correct Plan should produce (all read-only).
+- `composite_queries` (14) — a natural request plus the `expected_commands`
+  sequence a correct Plan should produce (all read-only); 4 of the 14 chain
+  3 real commands rather than 2.
 - `adversarial_queries` (5) — requests with no real capability behind them,
   plus why they should be rejected rather than answered with an invented
   command.
@@ -72,7 +73,7 @@ caught it before restoring the clean dataset.
 If you want to specifically exercise the Present-Plan-&-Confirm gate
 (Orchestration Protocol step 4 — the model presenting a plan and waiting
 for confirmation before running a write), do that by hand against the
-running server with a prompt like "Add a new vendor called Acme Corp,"
+running server with a prompt like "Add a new vendor,"
 rather than through this dataset or `run_dataset.py`.
 
 ## Running the whole dataset against a real server

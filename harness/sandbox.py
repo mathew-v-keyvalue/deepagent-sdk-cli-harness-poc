@@ -97,6 +97,12 @@ def scrub(text: str, secret: str | None) -> str:
 # Orchestration Protocol's Route step). Denied by default; nothing else is
 # on this list, including plain `cybersierra` with no install-on-demand
 # fallback path outside `npm install -g ...`.
+#
+# One disclosed, deliberate narrowing beyond that mirror:
+# DENIED_COMMAND_PREFIXES below carves two specific subcommands back out
+# of the blanket `cybersierra` allow. Not a style choice — see that
+# constant's own comment for the measured, log-confirmed harm that
+# justified it.
 ALLOWED_COMMAND_PREFIXES: tuple[str, ...] = (
     "cybersierra",
     "npx cybersierra",
@@ -104,11 +110,38 @@ ALLOWED_COMMAND_PREFIXES: tuple[str, ...] = (
     "python3",
 )
 
+# A small, explicit carve-out of the blanket "cybersierra" allow above —
+# these two subcommands are interactive, browser-opening, minutes-long-
+# polling auth-*acquisition* flows that can never succeed in this
+# non-interactive sandbox, and are explicitly out of scope by this
+# harness's own design: README "Authentication model" is explicit that
+# this harness does NOT perform login itself, on purpose, because auth is
+# assumed already done out-of-band by a human running `cybersierra auth
+# login-browser` interactively before the server starts. That assumption
+# doesn't stop the model from trying it anyway when it's stuck: confirmed
+# directly in logs/harness.log (a dataset run against a live server) — the
+# model invoked `cybersierra auth login-browser` twice in one turn,
+# burning 120s then a self-escalated 300s before each attempt timed out
+# (exit_code=124), over 7 minutes wasted on calls that were always going
+# to fail headlessly and long enough to blow past
+# dataset/run_dataset.py's own 180s client timeout. `cybersierra auth
+# whoami` (read-only, used successfully throughout those same logs) and
+# every other `cybersierra auth *` subcommand are unaffected.
+DENIED_COMMAND_PREFIXES: tuple[str, ...] = (
+    "cybersierra auth login-browser",
+    "cybersierra auth login",
+)
+
 DENY_EXIT_CODE = 126  # POSIX convention: command found but not executable/permitted.
 
 
+def _matches_prefix(command: str, prefix: str) -> bool:
+    return command == prefix or command.startswith(prefix + " ")
+
+
 def is_command_allowed(command: str) -> bool:
-    """True iff ``command`` starts with one of ``ALLOWED_COMMAND_PREFIXES``.
+    """True iff ``command`` starts with one of ``ALLOWED_COMMAND_PREFIXES``
+    and does not start with one of ``DENIED_COMMAND_PREFIXES``.
 
     Prefix matching only — like the sibling Claude POC's
     ``_guard_tool_use``, this does not parse shell grammar. A command like
@@ -122,12 +155,23 @@ def is_command_allowed(command: str) -> bool:
     command = command.strip()
     if not command:
         return False
-    return any(
-        command == prefix or command.startswith(prefix + " ") for prefix in ALLOWED_COMMAND_PREFIXES
-    )
+    if any(_matches_prefix(command, prefix) for prefix in DENIED_COMMAND_PREFIXES):
+        return False
+    return any(_matches_prefix(command, prefix) for prefix in ALLOWED_COMMAND_PREFIXES)
 
 
 def _denial_message(command: str) -> str:
+    command = command.strip()
+    if any(_matches_prefix(command, prefix) for prefix in DENIED_COMMAND_PREFIXES):
+        return (
+            f"Error: command not permitted in this sandbox: {command!r}. "
+            "Authentication is already handled out-of-band before this server starts "
+            "(a human already ran `cybersierra auth login-browser` interactively) -- "
+            "this session is already authenticated. Do not attempt to log in or "
+            "re-authenticate; if a command fails with an auth error, that reflects a "
+            "real permissions/access issue to report, not a missing login step to fix. "
+            "`cybersierra auth whoami` (read-only) is still available."
+        )
     return (
         f"Error: command not permitted in this sandbox: {command!r}. "
         f"Only commands starting with one of {ALLOWED_COMMAND_PREFIXES!r} may run here."

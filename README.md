@@ -212,13 +212,14 @@ python verify/verify_server_streaming_incremental.py
 python verify/validate_query_dataset.py
 ```
 
-`dataset/query_dataset.json` is 45 sample `/chat` queries — one per
+`dataset/query_dataset.json` is 51 sample `/chat` queries — one per
 **read-only** `cybersierra` manifest command (32; the manifest's other 5
 commands are writes and were deliberately excluded — see `dataset/README.md`
 "Write operations were removed," since `dataset/run_dataset.py` calls a
 real backend and a write example query would mean every dataset run
-actually creates/sends/submits/updates real data), plus 8 multi-step and 5
-deliberately unanswerable ones. See `dataset/README.md` for how it was
+actually creates/sends/submits/updates real data), plus 14 multi-step
+(4 of which chain 3 real commands, not just 2) and 5 deliberately
+unanswerable ones. See `dataset/README.md` for how it was
 built, and two real behavior gaps it caught by actually running it against
 a live server: the model guessing wrong CLI subcommands instead of reading
 the loaded skill first (fixed in `harness/agent.py`'s
@@ -531,6 +532,24 @@ everywhere else keep this silent when embedded in something that
 configures its own logging instead) — called automatically by
 `server/app.py` on import and by `harness/agent.py`'s own `__main__` demo.
 Set `HARNESS_LOG_LEVEL=DEBUG` (default `INFO`) to control verbosity.
+
+**Written to a real file, not just the console.** The first version of
+this only ever attached a console (`stderr`) handler — real for the
+lifetime of the terminal, gone the moment it closed. `configure_logging()`
+now also attaches a `logging.handlers.RotatingFileHandler` writing to
+`logs/harness.log` (created automatically; rotates at 10 MiB, keeps 5
+backups — `HARNESS_LOG_FILE`, `HARNESS_LOG_MAX_BYTES`,
+`HARNESS_LOG_BACKUP_COUNT` override any of that; set `HARNESS_LOG_FILE=""`
+to disable file logging and keep only the console). `logs/` is gitignored
+— it's runtime output, and while `access_token` is scrubbed out of every
+line (see `scrub()` below), CLI output previews and tool args are not, so
+treat it the way you'd treat any log file with real backend data in it.
+Verified in this session with a real live run: `logs/harness.log` after
+one `/chat` turn contains the full `turn_start` → `tool_call_allowed` →
+`cli_call_start`/`cli_call_done` (including a wrong-command guess, the
+manifest-discovery call, and the eventual correct `cybersierra tprm
+assessees count`) → `skills_available` → `turn_done` chain — the same
+content the console shows, just persisted.
 
 Every real CLI invocation, every tool call, and which skill got read are
 all real log lines, not something the chat UI shows — this is genuinely

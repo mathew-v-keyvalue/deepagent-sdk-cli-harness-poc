@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Dataset Results Viewer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --border: #e2e4e9;
+    --text: #1b1e24;
+    --text-dim: #6b7280;
+    --user-bubble: #2563eb;
+    --user-bubble-text: #ffffff;
+    --assistant-bubble: #eef0f4;
+    --assistant-bubble-text: #1b1e24;
+    --error-bg: #fdecec;
+    --error-border: #f2b8b8;
+    --error-text: #8a1c1c;
+    --ok: #157347;
+    --accent: #2563eb;
+    --code-bg: #eceef2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --panel: #1c1f26;
+      --border: #2c2f38;
+      --text: #e7e9ee;
+      --text-dim: #9aa0ab;
+      --user-bubble: #3b6fe0;
+      --user-bubble-text: #ffffff;
+      --assistant-bubble: #262a33;
+      --assistant-bubble-text: #e7e9ee;
+      --error-bg: #3a1c1c;
+      --error-border: #5c2b2b;
+      --error-text: #f3aaaa;
+      --ok: #4fbf7a;
+      --accent: #5b8def;
+      --code-bg: #2a2e37;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 20px;
+  }
+  h1 {
+    margin: 0 0 10px;
+    font-size: 17px;
+    font-weight: 700;
+  }
+  .subtitle {
+    color: var(--text-dim);
+    font-size: 12.5px;
+    margin-bottom: 12px;
+  }
+  .stats {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  .stat {
+    background: var(--assistant-bubble);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 12.5px;
+    color: var(--text-dim);
+  }
+  .stat b { color: var(--text); }
+  .controls {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .tabs {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .tab {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 999px;
+    padding: 5px 12px;
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  .tab.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  input[type="search"], input[type="file"] {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 13px;
+    flex: 1;
+    min-width: 180px;
+  }
+  label.checkbox {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12.5px;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+  main {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px;
+  }
+  .card-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  .badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+    letter-spacing: 0.02em;
+  }
+  .badge.cat-single { background: #e0ecff; color: #1d4ed8; }
+  .badge.cat-composite { background: #fdeacb; color: #9a5b00; }
+  .badge.cat-adversarial { background: #f4dcf9; color: #862d9c; }
+  @media (prefers-color-scheme: dark) {
+    .badge.cat-single { background: #163157; color: #8fb8ff; }
+    .badge.cat-composite { background: #4a3311; color: #f0c479; }
+    .badge.cat-adversarial { background: #45204c; color: #e8adf5; }
+  }
+  .badge.ok { background: #dcf5e6; color: var(--ok); }
+  .badge.err { background: var(--error-bg); color: var(--error-text); }
+  @media (prefers-color-scheme: dark) {
+    .badge.ok { background: #14371f; color: var(--ok); }
+  }
+  .dataset-id {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    color: var(--text-dim);
+  }
+  .meta-right {
+    margin-left: auto;
+    font-size: 11.5px;
+    color: var(--text-dim);
+    display: flex;
+    gap: 10px;
+  }
+  .bubble-row { display: flex; margin-bottom: 8px; }
+  .bubble-row.user { justify-content: flex-end; }
+  .bubble-row.assistant { justify-content: flex-start; }
+  .bubble {
+    max-width: 85%;
+    padding: 9px 13px;
+    border-radius: 14px;
+    font-size: 14px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+  }
+  .bubble.user {
+    background: var(--user-bubble);
+    color: var(--user-bubble-text);
+    border-bottom-right-radius: 4px;
+  }
+  .bubble.assistant {
+    background: var(--assistant-bubble);
+    color: var(--assistant-bubble-text);
+    border-bottom-left-radius: 4px;
+    white-space: normal;
+  }
+  .bubble.assistant :first-child { margin-top: 0; }
+  .bubble.assistant :last-child { margin-bottom: 0; }
+  .bubble.assistant p { margin: 0.4em 0; }
+  .bubble.assistant table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 12.5px;
+    margin: 0.5em 0;
+    display: block;
+    overflow-x: auto;
+  }
+  .bubble.assistant th, .bubble.assistant td {
+    border: 1px solid var(--border);
+    padding: 4px 8px;
+    text-align: left;
+  }
+  .bubble.assistant code {
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 12.5px;
+  }
+  .bubble.assistant pre {
+    background: var(--code-bg);
+    padding: 8px 10px;
+    border-radius: 8px;
+    overflow-x: auto;
+  }
+  .bubble.assistant pre code { padding: 0; background: none; }
+  .bubble.assistant ul, .bubble.assistant ol { padding-left: 1.3em; margin: 0.4em 0; }
+  .error-box {
+    background: var(--error-bg);
+    border: 1px solid var(--error-border);
+    color: var(--error-text);
+    border-radius: 10px;
+    padding: 8px 12px;
+    font-size: 13px;
+    margin-bottom: 8px;
+  }
+  .error-box code { font-size: 12px; }
+  details {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  summary { cursor: pointer; user-select: none; }
+  .detail-grid {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 4px 10px;
+    margin-top: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .chip {
+    display: inline-block;
+    background: var(--code-bg);
+    border-radius: 6px;
+    padding: 1px 7px;
+    margin: 1px 3px 1px 0;
+    font-size: 11px;
+  }
+  .empty, .loading {
+    text-align: center;
+    color: var(--text-dim);
+    padding: 40px 20px;
+    font-size: 14px;
+  }
+  .dropzone {
+    max-width: 500px;
+    margin: 40px auto;
+    text-align: center;
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 30px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .dropzone.drag { border-color: var(--accent); color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Dataset Results Viewer</h1>
+  <div class="subtitle" id="subtitle">Loading results.json…</div>
+  <div class="stats" id="stats"></div>
+  <div class="controls">
+    <div class="tabs" id="tabs">
+      <button class="tab active" data-cat="all">All</button>
+      <button class="tab" data-cat="single_command_queries">Single command</button>
+      <button class="tab" data-cat="composite_queries">Composite</button>
+      <button class="tab" data-cat="adversarial_queries">Adversarial</button>
+    </div>
+    <input type="search" id="search" placeholder="Search query text or id…" />
+    <label class="checkbox"><input type="checkbox" id="errorsOnly" /> Errors only</label>
+  </div>
+</header>
+
+<main id="main">
+  <div class="loading">Loading results.json…</div>
+</main>
+
+<script>
+  marked.setOptions({ breaks: true, gfm: true });
+
+  const CANDIDATE_PATHS = ["results.json", "./results.json", "dataset/results.json"];
+
+  let allResults = [];
+  let meta = { generated_at: null, base_url: null };
+  let state = { category: "all", search: "", errorsOnly: false };
+
+  const catLabel = {
+    single_command_queries: "Single command",
+    composite_queries: "Composite",
+    adversarial_queries: "Adversarial",
+  };
+  const catClass = {
+    single_command_queries: "cat-single",
+    composite_queries: "cat-composite",
+    adversarial_queries: "cat-adversarial",
+  };
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+  }
+
+  function renderMarkdown(text) {
+    if (!text) return "";
+    const raw = marked.parse(text);
+    return typeof DOMPurify !== "undefined" ? DOMPurify.sanitize(raw) : raw;
+  }
+
+  function expectedSummary(r) {
+    const e = r.expected || {};
+    if (r.category === "single_command_queries") {
+      return `command: <code>${escapeHtml(e.command || "")}</code>`;
+    }
+    if (r.category === "composite_queries") {
+      return `expected steps: ${(e.expected_commands || []).map((c) => `<code>${escapeHtml(c)}</code>`).join(" &rarr; ")}`;
+    }
+    if (r.category === "adversarial_queries") {
+      return `expected: <b>${escapeHtml(e.expected_behavior || "")}</b> — ${escapeHtml(e.reason || "")}`;
+    }
+    return "";
+  }
+
+  function renderCard(r) {
+    const isError = !!r.error;
+    const badgeCat = `<span class="badge ${catClass[r.category] || ""}">${catLabel[r.category] || r.category}</span>`;
+    const badgeStatus = isError
+      ? `<span class="badge err">error</span>`
+      : `<span class="badge ok">ok</span>`;
+
+    const tokens = r.usage
+      ? `${r.usage.total_tokens ?? "?"} tok`
+      : null;
+    const rightMeta = [
+      r.duration_seconds != null ? `${r.duration_seconds}s` : null,
+      tokens,
+      r.num_turns != null ? `${r.num_turns} turn${r.num_turns === 1 ? "" : "s"}` : null,
+    ].filter(Boolean).join(" · ");
+
+    const errorBox = isError
+      ? `<div class="error-box"><b>${escapeHtml(r.error.code || "error")}</b>: ${escapeHtml(r.error.message || "")}</div>`
+      : "";
+
+    const answerHtml = r.answer
+      ? `<div class="bubble-row assistant"><div class="bubble assistant">${renderMarkdown(r.answer)}</div></div>`
+      : (isError ? "" : `<div class="bubble-row assistant"><div class="bubble assistant"><em>(empty response)</em></div></div>`);
+
+    const toolChips = (r.tool_calls || []).length
+      ? (r.tool_calls || []).map((t) => `<span class="chip">${escapeHtml(t)}</span>`).join("")
+      : `<span class="chip">none</span>`;
+
+    return `
+      <div class="card" data-category="${r.category}">
+        <div class="card-meta">
+          ${badgeCat}
+          ${badgeStatus}
+          <span class="dataset-id">${escapeHtml(r.dataset_id)}</span>
+          <span class="meta-right">${escapeHtml(rightMeta)}</span>
+        </div>
+        <div class="bubble-row user"><div class="bubble user">${escapeHtml(r.query)}</div></div>
+        ${errorBox}
+        ${answerHtml}
+        <details>
+          <summary>Details</summary>
+          <div class="detail-grid">
+            <div>expected</div><div>${expectedSummary(r)}</div>
+            <div>tool calls</div><div>${toolChips}</div>
+            <div>session</div><div>${escapeHtml(r.session_id || "—")}</div>
+            <div>timestamp</div><div>${escapeHtml(r.timestamp || "—")}</div>
+          </div>
+        </details>
+      </div>
+    `;
+  }
+
+  function applyFiltersAndRender() {
+    const main = document.getElementById("main");
+    let filtered = allResults;
+
+    if (state.category !== "all") {
+      filtered = filtered.filter((r) => r.category === state.category);
+    }
+    if (state.errorsOnly) {
+      filtered = filtered.filter((r) => !!r.error);
+    }
+    if (state.search.trim()) {
+      const q = state.search.trim().toLowerCase();
+      filtered = filtered.filter(
+        (r) =>
+          r.query.toLowerCase().includes(q) ||
+          r.dataset_id.toLowerCase().includes(q)
+      );
+    }
+
+    if (!filtered.length) {
+      main.innerHTML = `<div class="empty">No results match the current filters.</div>`;
+      return;
+    }
+
+    main.innerHTML = filtered.map(renderCard).join("");
+  }
+
+  function renderStats() {
+    const total = allResults.length;
+    const errors = allResults.filter((r) => r.error).length;
+    const byCat = {};
+    for (const r of allResults) byCat[r.category] = (byCat[r.category] || 0) + 1;
+
+    document.getElementById("subtitle").textContent =
+      `${meta.base_url || "unknown host"} · generated ${meta.generated_at || "unknown time"}`;
+
+    document.getElementById("stats").innerHTML = `
+      <div class="stat"><b>${total}</b> total</div>
+      <div class="stat"><b>${total - errors}</b> ok</div>
+      <div class="stat"><b>${errors}</b> error${errors === 1 ? "" : "s"}</div>
+      <div class="stat"><b>${byCat.single_command_queries || 0}</b> single</div>
+      <div class="stat"><b>${byCat.composite_queries || 0}</b> composite</div>
+      <div class="stat"><b>${byCat.adversarial_queries || 0}</b> adversarial</div>
+    `;
+  }
+
+  function onDataLoaded(data) {
+    meta.generated_at = data.generated_at;
+    meta.base_url = data.base_url;
+    allResults = data.results || [];
+    renderStats();
+    applyFiltersAndRender();
+  }
+
+  function showDropzone(errMsg) {
+    document.getElementById("subtitle").textContent = errMsg || "Could not auto-load results.json";
+    document.getElementById("main").innerHTML = `
+      <div class="dropzone" id="dropzone">
+        Couldn't fetch <code>results.json</code> automatically (this usually
+        happens when the page is opened directly as a <code>file://</code>
+        URL — browsers block that fetch for security reasons).<br /><br />
+        Serve this folder over HTTP instead, e.g.:<br />
+        <code>cd dataset &amp;&amp; python3 -m http.server 8080</code><br />
+        then open <code>http://localhost:8080/results_viewer.html</code>.
+        <br /><br />
+        Or drop <code>results.json</code> here, or
+        <label style="text-decoration:underline; cursor:pointer;">
+          choose the file<input type="file" id="filePicker" accept="application/json" style="display:none" />
+        </label>.
+      </div>
+    `;
+    const dz = document.getElementById("dropzone");
+    const picker = document.getElementById("filePicker");
+    picker.addEventListener("change", (e) => {
+      const f = e.target.files[0];
+      if (f) readLocalFile(f);
+    });
+    ["dragover", "dragleave", "drop"].forEach((evt) =>
+      dz.addEventListener(evt, (e) => e.preventDefault())
+    );
+    dz.addEventListener("dragover", () => dz.classList.add("drag"));
+    dz.addEventListener("dragleave", () => dz.classList.remove("drag"));
+    dz.addEventListener("drop", (e) => {
+      dz.classList.remove("drag");
+      const f = e.dataTransfer.files[0];
+      if (f) readLocalFile(f);
+    });
+  }
+
+  function readLocalFile(file) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        onDataLoaded(JSON.parse(reader.result));
+      } catch (e) {
+        showDropzone("That file wasn't valid JSON: " + e.message);
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  async function loadResults() {
+    for (const path of CANDIDATE_PATHS) {
+      try {
+        const resp = await fetch(path + "?t=" + Date.now(), { cache: "no-store" });
+        if (!resp.ok) continue;
+        const data = await resp.json();
+        onDataLoaded(data);
+        return;
+      } catch (e) {
+        // try next candidate path
+      }
+    }
+    showDropzone();
+  }
+
+  document.getElementById("tabs").addEventListener("click", (e) => {
+    const btn = e.target.closest(".tab");
+    if (!btn) return;
+    document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    btn.classList.add("active");
+    state.category = btn.dataset.cat;
+    applyFiltersAndRender();
+  });
+  document.getElementById("search").addEventListener("input", (e) => {
+    state.search = e.target.value;
+    applyFiltersAndRender();
+  });
+  document.getElementById("errorsOnly").addEventListener("change", (e) => {
+    state.errorsOnly = e.target.checked;
+    applyFiltersAndRender();
+  });
+
+  loadResults();
+</script>
+</body>
+</html>
