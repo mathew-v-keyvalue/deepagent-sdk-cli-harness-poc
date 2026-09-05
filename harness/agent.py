@@ -132,7 +132,26 @@ _INJECT_ENV_VAR = "CYBERSIERRA_INJECT_ACCESS_TOKEN"
 # out of graph steps one or two calls before the correct final call. Not a
 # prompt-content fix -- raised so a multi-guess discovery sequence has room
 # to actually converge instead of being cut off near the end.
-GRAPH_RECURSION_LIMIT = 60
+#
+# 60, then 120, both still failed live on one particular query ("list
+# unread notifications" -- see logs/harness.log thread_id=91b62ab5-...),
+# each time after only ~8-9 logged tool calls. That first looked like a
+# fixed per-action middleware-overhead multiplier, but isolated replay
+# disproved that: instrumenting graph.astream_events() directly (counting
+# on_chain_start/on_tool_start events, not just this harness's own
+# tool_call_* logging) showed the SAME prompt, run standalone and also
+# reproduced as the exact "Hi" -> notifications two-turn sequence that
+# failed live, both completing normally in ~20 model rounds / ~40 total
+# graph steps -- comfortably under even the original 60. So this is
+# run-to-run variance in how many rounds the model needs to converge on
+# this manifest-driven CLI's command surface, not a fixed multiplier and
+# not an infinite loop: most trajectories are cheap, but an unlucky one
+# (extra reasoning-only rounds, or a malformed-tool-call retry caught by
+# DeepAgents' own PatchToolCallsMiddleware) can still run well past 120.
+# Raised again, further, for headroom over the one observed live failure
+# at 120 -- not a guarantee no trajectory ever exceeds this, just a wider
+# margin against the variance actually observed.
+GRAPH_RECURSION_LIMIT = 200
 
 
 def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None = None):
