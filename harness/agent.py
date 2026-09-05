@@ -49,35 +49,30 @@ logger = logging.getLogger("harness.agent")
 logger.addHandler(logging.NullHandler())
 
 # Generic-only, same spirit as the Claude POC's SYSTEM_PROMPT_APPENDIX: no
-# mention of cybersierra, compliance, or any specific command. Three
+# mention of cybersierra, compliance, or any specific command. Two
 # additions that ARE harness-specific (not domain-specific): the tool-name
 # bridge (the real skill's frontmatter and body were authored for Claude
 # Code's tool names — `Bash`, `Read`, `Write` — and DeepAgents' names differ
 # — `execute`, `read_file`, `write_file`; rather than edit the ported skill
 # files, see skills/cyber-sierra/, copied verbatim on purpose as primary
-# source, we bridge the naming gap here), the "read before guessing" line —
-# added after dataset/README.md's spot-checking caught the model guessing
-# plausible-but-wrong CLI subcommands (`cybersierra vendors list`,
-# `cybersierra get vendors`, ...) instead of reading the loaded skill fully
-# first, even though that skill's own text already says to discover the
-# real command surface before acting (see dataset/README.md "Observed
-# limitation" for the before/after log evidence) — and the "skip confirm
-# on read-only plans" line. That last one resolves a real contradiction
-# inside the copied skill itself, not a harness bug: SKILL.md's own Step 4
-# ("Present Plan & Confirm") says to ask for confirmation before every
-# plan, full stop, while _internal/shared/manifest-usage.md's "Safety"
-# section says `safe: true` (read-only) commands should "execute freely"
-# and only `safe: false` ones "require user confirmation" — Step 5
-# (Execute) agrees with the second version. Observed in practice: a
-# read-only, single-step plan (e.g. listing records with no write
-# involved) still stopped to ask "shall I proceed?", which breaks any
-# fully-automated run (this repo's own dataset run included — every
-# dataset/query_dataset.json entry is deliberately read-only) since those
-# expect one turn in, one real answer out, not a second turn to approve a
-# plan that never needed approving. Per "copied verbatim on purpose,"
-# SKILL.md itself was not edited to resolve this — the contradiction is
-# resolved here instead, in the safer direction the CLI's own norm and
-# manifest-usage.md already state.
+# source, we bridge the naming gap here), and the "read before guessing" /
+# discovery-escalation lines — added after dataset/README.md's spot-checking
+# caught the model guessing plausible-but-wrong CLI subcommands (`cybersierra
+# vendors list`, `cybersierra get vendors`, ...) instead of reading the
+# loaded skill fully first, even though that skill's own text already says
+# to discover the real command surface before acting (see dataset/README.md
+# "Observed limitation" for the before/after log evidence).
+#
+# A third addition — telling the model to skip the plan-confirmation step
+# for read-only plans — was tried and then deliberately removed. It bypassed
+# the real skill's own Step 4 ("Present Plan & Confirm") gate, which the
+# rest of this port treats as sacrosanct (see README "Porting the real
+# pipeline" — the soft, instruction-based confirmation gate is called out
+# explicitly as intentional, matching the source system's own design, not
+# something to route around at the harness level). If read-only plans
+# stopping to confirm is a real problem, the right fix is resolving the
+# contradiction inside skills/cyber-sierra/ itself (a disclosed exception to
+# "copied verbatim"), not overriding confirmation behavior from the harness.
 SYSTEM_PROMPT_APPENDIX = (
     "If an available skill matches the user's request, use it rather than "
     "answering from general knowledge alone.\n\n"
@@ -102,14 +97,7 @@ SYSTEM_PROMPT_APPENDIX = (
     "guessing plausible-sounding subcommand or flag names. If two guesses "
     "against the same CLI fail in a row, stop guessing and escalate to that "
     "CLI's own --help instead of trying a third guess; never repeat the "
-    "exact same shallow discovery call more than once without escalating.\n\n"
-    "When a loaded skill's plan-and-confirm step distinguishes read-only "
-    "actions from state-changing ones (however that skill labels the "
-    "distinction, e.g. `safe: true` / `safe: false`), only pause for the "
-    "user's explicit confirmation before executing when the plan contains "
-    "at least one state-changing action. If every action in the plan is "
-    "read-only, execute the plan directly and report the result -- do not "
-    "ask the user to confirm a plan that changes nothing."
+    "exact same shallow discovery call more than once without escalating."
 )
 
 # One checkpointer for the life of this process, shared by every session —
