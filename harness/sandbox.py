@@ -63,6 +63,8 @@ from deepagents.backends.protocol import ExecuteResponse
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import ToolMessage
 
+from harness.tracing import Netra, SpanType
+
 if TYPE_CHECKING:
     from langchain.agents.middleware.types import ToolCallRequest
 
@@ -204,39 +206,53 @@ class AllowlistedShellBackend(LocalShellBackend):
         self._redact = redact
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
-        if not is_command_allowed(command):
-            logger.warning(
-                "cli_call_denied command=%r",
-                scrub(command, self._redact),
-                extra={"event": "cli_call_denied", "command": scrub(command, self._redact)},
-            )
-            return ExecuteResponse(
-                output=_denial_message(command),
-                exit_code=DENY_EXIT_CODE,
-                truncated=False,
-            )
+        with Netra.start_span("CLI_Call", as_type=SpanType.TOOL, module_name="sandbox") as span:
+            span.set_attribute("cli.command", scrub(command, self._redact))
 
-        logger.info(
-            "cli_call_start command=%r",
-            scrub(command, self._redact),
-            extra={"event": "cli_call_start", "command": scrub(command, self._redact)},
-        )
-        response = super().execute(command, timeout=timeout)
-        logger.info(
-            "cli_call_done command=%r exit_code=%s truncated=%s output=%r",
-            scrub(command, self._redact),
-            response.exit_code,
-            response.truncated,
-            scrub(response.output, self._redact)[:500],
-            extra={
-                "event": "cli_call_done",
-                "command": scrub(command, self._redact),
-                "exit_code": response.exit_code,
-                "truncated": response.truncated,
-                "output_preview": scrub(response.output, self._redact)[:500],
-            },
-        )
-        return response
+            if not is_command_allowed(command):
+                logger.warning(
+                    "cli_call_denied command=%r",
+                    scrub(command, self._redact),
+                    extra={"event": "cli_call_denied", "command": scrub(command, self._redact)},
+                )
+                span.set_attribute("cli.status", "denied")
+                span.set_success()
+                return ExecuteResponse(
+                    output=_denial_message(command),
+                    exit_code=DENY_EXIT_CODE,
+                    truncated=False,
+                )
+
+            logger.info(
+                "cli_call_start command=%r",
+                scrub(command, self._redact),
+                extra={"event": "cli_call_start", "command": scrub(command, self._redact)},
+            )
+            try:
+                response = super().execute(command, timeout=timeout)
+            except Exception as exc:
+                span.set_attribute("cli.status", "error")
+                span.set_error(str(exc))
+                raise
+            logger.info(
+                "cli_call_done command=%r exit_code=%s truncated=%s output=%r",
+                scrub(command, self._redact),
+                response.exit_code,
+                response.truncated,
+                scrub(response.output, self._redact)[:500],
+                extra={
+                    "event": "cli_call_done",
+                    "command": scrub(command, self._redact),
+                    "exit_code": response.exit_code,
+                    "truncated": response.truncated,
+                    "output_preview": scrub(response.output, self._redact)[:500],
+                },
+            )
+            span.set_attribute("cli.exit_code", str(response.exit_code))
+            span.set_attribute("cli.truncated", str(response.truncated))
+            span.set_attribute("cli.status", "ok" if response.exit_code == 0 else "nonzero_exit")
+            span.set_success()
+            return response
 
 
 class ShellSandboxMiddleware(AgentMiddleware):

@@ -38,6 +38,7 @@ from fastapi.staticfiles import StaticFiles
 
 from harness.agent import Done, Failed, TextDelta, ToolUseStarted, stream
 from harness.observability import configure_logging
+from harness.tracing import init_tracing
 from server.sessions import store
 
 load_dotenv(override=False)
@@ -45,6 +46,8 @@ configure_logging()  # see harness/observability.py — this is what makes
 # cli_call_*/tool_call_*/skill_loaded/turn_* log lines actually print when
 # running `uvicorn server.app:app`, not just when embedded in a script
 # that configures its own logging.
+init_tracing()  # see harness/tracing.py — no-op unless NETRA_TRACING and
+# NETRA_API_KEY are both set; enables the CLI_Call/Plan_Step/Agent_Turn spans.
 
 app = FastAPI(title="cybersierra chat server (DeepAgents POC)")
 

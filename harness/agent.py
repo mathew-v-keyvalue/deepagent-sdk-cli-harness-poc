@@ -21,6 +21,7 @@ doesn't.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -35,6 +36,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from harness.executor_tool import make_run_execution_plan_tool
 from harness.model import resolve_model
 from harness.sandbox import AllowlistedShellBackend, ShellSandboxMiddleware, scrub
+from harness.tracing import Netra, SpanType
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SKILLS_ROOT = PROJECT_ROOT / "skills"
@@ -250,27 +252,36 @@ async def run(prompt: str, access_token: str = "") -> str:
     )
 
     final_text = ""
-    async for event in graph.astream_events(
-        {"messages": [HumanMessage(content=prompt)]}, config, version="v2"
-    ):
-        if event["event"] == "on_chat_model_end":
-            message = event["data"]["output"]
-            text = _extract_text(message)
-            if text:
-                final_text = text
+    with Netra.start_span("Agent_Turn", as_type=SpanType.TOOL, module_name="agent") as span:
+        span.set_attribute("agent.thread_id", thread_id)
+        try:
+            async for event in graph.astream_events(
+                {"messages": [HumanMessage(content=prompt)]}, config, version="v2"
+            ):
+                if event["event"] == "on_chat_model_end":
+                    message = event["data"]["output"]
+                    text = _extract_text(message)
+                    if text:
+                        final_text = text
 
-    # Only meaningful AFTER the graph has actually run at least once on
-    # this thread: SkillsMiddleware populates `skills_metadata` via its
-    # `before_agent` hook during execution, not at graph-construction time
-    # — calling this before the loop above logged an empty list every
-    # time (caught by testing, not assumed; see README "Proper logging").
-    await _log_skills_available(graph, config, access_token)
+            # Only meaningful AFTER the graph has actually run at least once on
+            # this thread: SkillsMiddleware populates `skills_metadata` via its
+            # `before_agent` hook during execution, not at graph-construction time
+            # — calling this before the loop above logged an empty list every
+            # time (caught by testing, not assumed; see README "Proper logging").
+            await _log_skills_available(graph, config, access_token)
 
-    logger.info(
-        "turn_done thread_id=%s",
-        thread_id,
-        extra={"event": "turn_done", "thread_id": thread_id},
-    )
+            logger.info(
+                "turn_done thread_id=%s",
+                thread_id,
+                extra={"event": "turn_done", "thread_id": thread_id},
+            )
+            span.set_attribute("agent.status", "success")
+            span.set_success()
+        except Exception as exc:  # noqa: BLE001 — re-raised unchanged, span is observability only
+            span.set_attribute("agent.status", "failed")
+            span.set_error(str(exc))
+            raise
     return final_text
 
 
@@ -375,55 +386,68 @@ async def stream(
     try:
         graph = _build_agent(access_token)
 
-        async for event in graph.astream_events(
-            {"messages": [HumanMessage(content=prompt)]}, config, version="v2"
-        ):
-            kind = event["event"]
-            if kind == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                text = _extract_text(chunk)
-                if text:
-                    yield TextDelta(text)
-            elif kind == "on_tool_start":
-                tool_calls_seen.append(event["name"])
-                yield ToolUseStarted(event["name"])
-            elif kind == "on_chat_model_end":
-                num_turns += 1
-                message = event["data"]["output"]
-                for key, value in (getattr(message, "usage_metadata", None) or {}).items():
-                    if isinstance(value, int):
-                        usage_totals[key] = usage_totals.get(key, 0) + value
+        with Netra.start_span("Agent_Turn", as_type=SpanType.TOOL, module_name="agent") as span:
+            span.set_attribute("agent.thread_id", thread_id)
+            span.set_attribute("agent.is_new_session", str(session_id is not None))
+            try:
+                async for event in graph.astream_events(
+                    {"messages": [HumanMessage(content=prompt)]}, config, version="v2"
+                ):
+                    kind = event["event"]
+                    if kind == "on_chat_model_stream":
+                        chunk = event["data"]["chunk"]
+                        text = _extract_text(chunk)
+                        if text:
+                            yield TextDelta(text)
+                    elif kind == "on_tool_start":
+                        tool_calls_seen.append(event["name"])
+                        yield ToolUseStarted(event["name"])
+                    elif kind == "on_chat_model_end":
+                        num_turns += 1
+                        message = event["data"]["output"]
+                        for key, value in (getattr(message, "usage_metadata", None) or {}).items():
+                            if isinstance(value, int):
+                                usage_totals[key] = usage_totals.get(key, 0) + value
 
-        # After the run, not before — see the identical comment in run()
-        # for why this ordering matters (before_agent hasn't populated
-        # skills_metadata until the graph has actually executed once).
-        await _log_skills_available(graph, config, access_token)
+                # After the run, not before — see the identical comment in run()
+                # for why this ordering matters (before_agent hasn't populated
+                # skills_metadata until the graph has actually executed once).
+                await _log_skills_available(graph, config, access_token)
 
-        logger.info(
-            "turn_done thread_id=%s num_turns=%d tool_calls=%r usage=%r",
-            thread_id,
-            num_turns,
-            tool_calls_seen,
-            usage_totals,
-            extra={
-                "event": "turn_done",
-                "thread_id": thread_id,
-                "num_turns": num_turns,
-                "tool_calls": tool_calls_seen,
-                "usage": usage_totals,
-            },
-        )
-        yield Done(
-            session_id=thread_id,
-            subtype="success",
-            # LangChain/DeepAgents does not compute a dollar cost the way
-            # the Claude SDK's ResultMessage does (that's Anthropic-specific
-            # pricing knowledge baked into the SDK) — always None here, by
-            # design, not a bug. See README "SSE contract: shape vs content".
-            total_cost_usd=None,
-            usage=usage_totals or None,
-            num_turns=num_turns or None,
-        )
+                logger.info(
+                    "turn_done thread_id=%s num_turns=%d tool_calls=%r usage=%r",
+                    thread_id,
+                    num_turns,
+                    tool_calls_seen,
+                    usage_totals,
+                    extra={
+                        "event": "turn_done",
+                        "thread_id": thread_id,
+                        "num_turns": num_turns,
+                        "tool_calls": tool_calls_seen,
+                        "usage": usage_totals,
+                    },
+                )
+                span.set_attribute("agent.num_turns", str(num_turns))
+                span.set_attribute("agent.tool_calls", json.dumps(tool_calls_seen))
+                span.set_attribute("agent.usage", json.dumps(usage_totals))
+                span.set_attribute("agent.status", "success")
+                span.set_success()
+                yield Done(
+                    session_id=thread_id,
+                    subtype="success",
+                    # LangChain/DeepAgents does not compute a dollar cost the way
+                    # the Claude SDK's ResultMessage does (that's Anthropic-specific
+                    # pricing knowledge baked into the SDK) — always None here, by
+                    # design, not a bug. See README "SSE contract: shape vs content".
+                    total_cost_usd=None,
+                    usage=usage_totals or None,
+                    num_turns=num_turns or None,
+                )
+            except Exception as exc:  # noqa: BLE001 — mirrors the outer handler below
+                span.set_attribute("agent.status", "failed")
+                span.set_error(str(exc))
+                raise
     except Exception as exc:  # noqa: BLE001 — deliberately broad, see Claude POC's ClaudeSDKError handling
         logger.exception("harness_error thread_id=%s", thread_id, extra={"event": "harness_error", "thread_id": thread_id})
         yield Failed("harness_error", str(exc))
@@ -436,9 +460,11 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
 
     from harness.observability import configure_logging
+    from harness.tracing import init_tracing
 
     load_dotenv(override=False)
     configure_logging()
+    init_tracing()
 
     demo_token = os.environ.get("CYBERSIERRA_DEMO_TOKEN", "placeholder-token-not-real")
     demo_prompt = sys.argv[1] if len(sys.argv) > 1 else "Who are you and what can you help me with?"

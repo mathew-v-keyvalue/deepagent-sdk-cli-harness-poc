@@ -40,6 +40,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from deepagents.backends.protocol import SandboxBackendProtocol
+from harness.tracing import Netra, SpanType
 
 # The real CLI invocation for each step is already logged by
 # AllowlistedShellBackend.execute (harness/sandbox.py: cli_call_start/
@@ -187,94 +188,107 @@ def make_run_execution_plan_tool(backend: SandboxBackendProtocol):
             step_id = step["id"]
             timestamp = datetime.now(UTC).isoformat()
             start = time.monotonic()
-            logger.info(
-                "plan_step_start planId=%r stepId=%d command=%r reason=%r",
-                plan.get("planId"),
-                step_id,
-                step["command"],
-                step.get("reason"),
-                extra={
-                    "event": "plan_step_start",
-                    "planId": plan.get("planId"),
-                    "stepId": step_id,
-                    "command": step["command"],
-                    "reason": step.get("reason"),
-                },
-            )
-            try:
-                resolved_args = _resolve(step.get("arguments", {}), inputs, step_outputs, step_id)
-                resolved_command = _build_command(step["command"], resolved_args)
-            except PlanExecutionError as exc:
-                logger.warning(
-                    "plan_step_failed planId=%r stepId=%d error=%r",
+            with Netra.start_span("Plan_Step", as_type=SpanType.TOOL, module_name="executor") as span:
+                span.set_attribute("plan.id", str(plan.get("planId")))
+                span.set_attribute("plan.step_id", str(step_id))
+                span.set_attribute("plan.command", step["command"])
+
+                logger.info(
+                    "plan_step_start planId=%r stepId=%d command=%r reason=%r",
                     plan.get("planId"),
                     step_id,
-                    str(exc),
-                    extra={"event": "plan_step_failed", "planId": plan.get("planId"), "stepId": step_id, "error": str(exc)},
-                )
-                execution_log.append(
-                    {
+                    step["command"],
+                    step.get("reason"),
+                    extra={
+                        "event": "plan_step_start",
+                        "planId": plan.get("planId"),
                         "stepId": step_id,
                         "command": step["command"],
-                        "arguments": step.get("arguments", {}),
-                        "stdout": "",
-                        "stderr": str(exc),
-                        "exitCode": -1,
-                        "success": False,
-                        "duration": round((time.monotonic() - start) * 1000, 1),
-                        "timestamp": timestamp,
-                    }
+                        "reason": step.get("reason"),
+                    },
                 )
-                steps_failed += 1
-                break
+                try:
+                    resolved_args = _resolve(step.get("arguments", {}), inputs, step_outputs, step_id)
+                    resolved_command = _build_command(step["command"], resolved_args)
+                except PlanExecutionError as exc:
+                    logger.warning(
+                        "plan_step_failed planId=%r stepId=%d error=%r",
+                        plan.get("planId"),
+                        step_id,
+                        str(exc),
+                        extra={"event": "plan_step_failed", "planId": plan.get("planId"), "stepId": step_id, "error": str(exc)},
+                    )
+                    execution_log.append(
+                        {
+                            "stepId": step_id,
+                            "command": step["command"],
+                            "arguments": step.get("arguments", {}),
+                            "stdout": "",
+                            "stderr": str(exc),
+                            "exitCode": -1,
+                            "success": False,
+                            "duration": round((time.monotonic() - start) * 1000, 1),
+                            "timestamp": timestamp,
+                        }
+                    )
+                    steps_failed += 1
+                    span.set_attribute("plan.status", "resolve_error")
+                    span.set_error(str(exc))
+                    break
 
-            # The real CLI invocation itself is logged by
-            # AllowlistedShellBackend.execute (cli_call_start/cli_call_done)
-            # — this is the same backend the agent's own `execute` tool
-            # calls go through, so a plan step and an ad-hoc tool call are
-            # both visible in the same cli_call_* log stream.
-            response = backend.execute(resolved_command)
-            stdout, stderr = _split_stderr(response.output)
-            success = response.exit_code == 0
-            logger.info(
-                "plan_step_done planId=%r stepId=%d exitCode=%d success=%s",
-                plan.get("planId"),
-                step_id,
-                response.exit_code,
-                success,
-                extra={
-                    "event": "plan_step_done",
-                    "planId": plan.get("planId"),
+                # The real CLI invocation itself is logged by
+                # AllowlistedShellBackend.execute (cli_call_start/cli_call_done)
+                # — this is the same backend the agent's own `execute` tool
+                # calls go through, so a plan step and an ad-hoc tool call are
+                # both visible in the same cli_call_* log stream.
+                response = backend.execute(resolved_command)
+                stdout, stderr = _split_stderr(response.output)
+                success = response.exit_code == 0
+                logger.info(
+                    "plan_step_done planId=%r stepId=%d exitCode=%d success=%s",
+                    plan.get("planId"),
+                    step_id,
+                    response.exit_code,
+                    success,
+                    extra={
+                        "event": "plan_step_done",
+                        "planId": plan.get("planId"),
+                        "stepId": step_id,
+                        "exitCode": response.exit_code,
+                        "success": success,
+                    },
+                )
+                span.set_attribute("plan.exit_code", str(response.exit_code))
+                span.set_attribute("plan.duration_ms", str(round((time.monotonic() - start) * 1000, 1)))
+
+                entry = {
                     "stepId": step_id,
+                    "command": resolved_command,
+                    "arguments": resolved_args,
+                    "stdout": stdout,
+                    "stderr": stderr,
                     "exitCode": response.exit_code,
                     "success": success,
-                },
-            )
+                    "duration": round((time.monotonic() - start) * 1000, 1),
+                    "timestamp": timestamp,
+                }
+                execution_log.append(entry)
 
-            entry = {
-                "stepId": step_id,
-                "command": resolved_command,
-                "arguments": resolved_args,
-                "stdout": stdout,
-                "stderr": stderr,
-                "exitCode": response.exit_code,
-                "success": success,
-                "duration": round((time.monotonic() - start) * 1000, 1),
-                "timestamp": timestamp,
-            }
-            execution_log.append(entry)
-
-            if success:
-                steps_completed += 1
-                try:
-                    parsed = json.loads(stdout)
-                except (json.JSONDecodeError, ValueError):
-                    parsed = stdout
-                step_outputs[step_id] = parsed
-                final_output = parsed
-            else:
-                steps_failed += 1
-                break  # contracts.md: "Halts on first non-zero exit code"
+                if success:
+                    steps_completed += 1
+                    try:
+                        parsed = json.loads(stdout)
+                    except (json.JSONDecodeError, ValueError):
+                        parsed = stdout
+                    step_outputs[step_id] = parsed
+                    final_output = parsed
+                    span.set_attribute("plan.status", "success")
+                    span.set_success()
+                else:
+                    steps_failed += 1
+                    span.set_attribute("plan.status", "failed")
+                    span.set_error(f"non-zero exit code {response.exit_code}")
+                    break  # contracts.md: "Halts on first non-zero exit code"
 
         result = {
             "success": steps_failed == 0 and steps_completed == len(steps),
