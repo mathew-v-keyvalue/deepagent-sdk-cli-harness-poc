@@ -67,6 +67,14 @@ convenience, not something `run()` does.
 uvicorn server.app:app --reload
 ```
 
+CORS: browser callers on another origin (e.g. the morpheus_fe "AI Chat"
+widget) need `FRONTEND_ORIGINS` set to their origin(s), comma-separated —
+see `.env.example`. Defaults to `http://localhost:8000` (Umi's dev-server
+default) if unset. If running both this server and a Umi dev server
+locally, note they share that same default port 8000 — start this one on
+a different port, e.g. `uvicorn server.app:app --reload --port 8001`, and
+point `FRONTEND_ORIGINS`/the frontend's API base URL accordingly.
+
 `POST /chat` — same three form fields and five SSE event names as the
 sibling POC. One deliberate, disclosed contract deviation:
 **`access_token` is no longer required** (`400 no_token` was dropped) —

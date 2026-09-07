@@ -28,11 +28,13 @@ accepts deliberately rather than solving.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -50,6 +52,22 @@ init_tracing()  # see harness/tracing.py — no-op unless NETRA_TRACING and
 # NETRA_API_KEY are both set; enables the CLI_Call/Plan_Step/Agent_Turn spans.
 
 app = FastAPI(title="cybersierra chat server (DeepAgents POC)")
+
+# Browser callers (e.g. the morpheus_fe "AI Chat" widget) live on a different
+# origin than this server, so /chat and /health need CORS to be reachable
+# from JS `fetch`. FRONTEND_ORIGINS is a comma-separated allowlist; falls
+# back to the morpheus_fe dev-server default (see its README/config) when
+# unset. Static-served `frontend/index.html` below is same-origin and
+# unaffected either way.
+_allowed_origins = [
+    o.strip() for o in os.environ.get("FRONTEND_ORIGINS", "").split(",") if o.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins or ["http://localhost:8000"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 _FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
