@@ -19,7 +19,7 @@ import sys
 
 import httpx
 
-from _server_helper import read_sse_events, running_server
+from _server_helper import TEST_SERVICE_AUTH, read_sse_events, running_server
 
 MIN_SPREAD_SECONDS = 0.3
 PLACEHOLDER_TOKEN = "placeholder-token-not-real"
@@ -27,7 +27,9 @@ PLACEHOLDER_TOKEN = "placeholder-token-not-real"
 
 async def main() -> int:
     with running_server(port=8101) as base_url:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        async with httpx.AsyncClient(
+            timeout=90.0, headers={"X-Service-Auth": TEST_SERVICE_AUTH}
+        ) as client:
             async with client.stream(
                 "POST",
                 f"{base_url}/chat",

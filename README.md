@@ -22,6 +22,15 @@ against. This one sandboxes the **real** product CLI —
 `plugins/cyber-sierra/skills/cyber-sierra/` — see "Porting the real
 pipeline" below), not a toy example.
 
+## v2: Wired into Morpheus (frontend → backend → this service)
+
+This service is now reachable from Tracy, the chat widget in morpheus_fe,
+via morpheus_backend as a proxy — not called directly from the browser.
+**Full documentation of this integration — architecture, the complete auth
+flow, and what changed in all three repos (frontend, backend, and this
+service) — lives in [`poc-wiki/v2/`](poc-wiki/v2/README.md), not scattered
+across this file.** Start there.
+
 ## Install
 
 ```bash
@@ -43,7 +52,12 @@ cybersierra auth login-browser --url https://morpheus-api.prod.cybersierra.ai/
 
 That login step matters and is explained in full under "Authentication
 model" below — short version: this harness does **not** perform login
-itself, on purpose.
+itself, on purpose. This is the simplest path for running this Quickstart
+standalone, with the bundled `frontend/index.html` test page; it is **not**
+required for a real deployment behind morpheus_backend, which authenticates
+per-request instead (see "Authentication model" — `CYBERSIERRA_BASE_URL` +
+`CYBERSIERRA_INJECT_ACCESS_TOKEN=1`) and needs zero interactive login on the
+server host, ever.
 
 ```bash
 cp .env.example .env
@@ -178,7 +192,7 @@ either):
 
 - **Env-token isolation**, without needing real cybersierra accounts: two
   concurrent sessions, two distinct marker strings as `access_token`, each
-  asked to run `python3 -c "...os.environ.get('CYBERSIERRA_TOKEN')..."`
+  asked to run `python3 -c "...os.environ.get('MORPHEUS_TOKEN')..."`
   via the sandboxed `execute` tool and report exactly what it printed.
   Asserts each session's answer contains only its own marker. `python3` is
   itself on the shell allowlist, which is what makes this fully
@@ -186,7 +200,10 @@ either):
   cybersierra's backend. This check launches its own server with
   `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` (see "Authentication model" below —
   injection is opt-in, off by default) specifically so there's something
-  in `CYBERSIERRA_TOKEN` to observe at all.
+  in `MORPHEUS_TOKEN` to observe at all. (This section originally read
+  `CYBERSIERRA_TOKEN` throughout — that variable name was never actually
+  correct; see "Authentication model" for the correction and how it was
+  caught.)
 - **Conversation-state isolation**: same placeholder token, two different
   concurrent `session_id`s told "red" and "blue," a follow-up on each
   proving neither leaked — same design as the sibling POC's identically
@@ -368,17 +385,17 @@ to engineer.
 real, sequential fixes, each caught by a direct question, not by testing:**
 
 *Fix 1 — injection became opt-in.* The first version of this harness
-*unconditionally* injected `access_token`, per call, as `CYBERSIERRA_TOKEN`
-in the sandboxed subprocess's environment, with `access_token` itself
-required on every `/chat` request (`400 no_token` if missing) for exact
-SSE-contract parity with the sibling POC. That's a real, verified
-mechanism (see below) — but making it the *default*, with no real per-user
-JWTs to put in the UI's token field, quietly broke the "already logged in
-via `cybersierra auth login-browser`" assumption this whole POC is built
-on: grepping the installed CLI binary directly
-(`~/.cybersierra/bin/cybersierra`) confirms `token: process.env
-.CYBERSIERRA_TOKEN ?? i.token` — and JavaScript's `??` only falls back to
-`i.token` (the persisted profile) on `null`/`undefined`, not on a wrong
+*unconditionally* injected `access_token`, per call, into the sandboxed
+subprocess's environment, with `access_token` itself required on every
+`/chat` request (`400 no_token` if missing) for exact SSE-contract parity
+with the sibling POC. That's a real, verified mechanism (see below) — but
+making it the *default*, with no real per-user JWTs to put in the UI's
+token field, quietly broke the "already logged in via `cybersierra auth
+login-browser`" assumption this whole POC is built on: the CLI's profile
+resolution overrides the persisted profile's token with
+`process.env.MORPHEUS_TOKEN` (see the correction below for how this
+variable name was originally gotten wrong), and JavaScript's `??` only
+falls back to the persisted profile on `null`/`undefined`, not on a wrong
 string. So a UI placeholder like `placeholder-token-not-real` — never
 intended as a real credential — was overriding an already-working,
 already-authenticated profile and getting rejected by the real backend on
@@ -386,9 +403,47 @@ every cybersierra call, silently defeating the entire point of the
 one-time-login assumption. Fix: injection became opt-in —
 `CYBERSIERRA_INJECT_ACCESS_TOKEN` (unset/empty by default; see
 `.env.example`), checked in `harness/agent.py`'s `_build_agent`. With it
-unset, `CYBERSIERRA_TOKEN` is simply never added to the subprocess env
+unset, `MORPHEUS_TOKEN` is simply never added to the subprocess env
 dict at all, so the CLI's own env resolution falls through to the
 persisted profile.
+
+**Correction (post-v2-wiring review): the override variable name was wrong
+in every version of this repo up to this point.** This section, and the
+code it described, previously said `CYBERSIERRA_TOKEN` throughout — plausible-
+looking (it matches this product's name), but never actually true. Caught
+by directly grepping the real installed CLI binary
+(`~/.cybersierra/bin/cybersierra`) for the literal string `CYBERSIERRA_TOKEN`:
+zero matches, anywhere. The actual variable, found by grepping for the
+resolved-profile object instead, is `MORPHEUS_TOKEN`:
+```
+{baseUrl: process.env.MORPHEUS_BASE_URL ?? i.baseUrl,
+ orgId: process.env.MORPHEUS_ORG ?? i.orgId,
+ token: process.env.MORPHEUS_TOKEN ?? i.token, ...}
+```
+Reproduced live, directly against the installed binary (real `HOME`, real
+persisted profile already logged in):
+```
+$ env -i CYBERSIERRA_TOKEN="fake.jwt.token" PATH="$PATH" HOME="$HOME" cybersierra auth whoami
+{"data": {"profile": "default", "email": "...", ...}}   # ignored -- same as no env var at all
+$ env -i MORPHEUS_TOKEN="fake.jwt.token" PATH="$PATH" HOME="$HOME" cybersierra auth whoami
+{"error": {"code": 2, "message": "Invalid token"}}      # read and used -- rejected because it's fake, not ignored
+```
+That second result — a real rejection from the backend, not a silent
+fallback to the persisted profile — is what actually proves the override
+is read; a real (non-fake) `MORPHEUS_TOKEN` would succeed as that identity
+instead. `CYBERSIERRA_TOKEN` produces the exact same output as setting no
+override at all, in every case tested. This means
+`CYBERSIERRA_INJECT_ACCESS_TOKEN=1` was a **silent no-op** in every prior
+version of this harness — the persisted profile's identity was used for
+every CLI call regardless of what per-request token was sent, the opposite
+of what this whole section claims. `harness/agent.py`, `harness/sandbox.py`,
+and `verify/verify_server_multi_session_isolation.py` are now fixed to use
+`MORPHEUS_TOKEN`; this correction note documents why, since the rest of
+this section (and the "verified empirically" transcript below, which used
+a fake `HOME` with no persisted profile at all — a different code path
+than a real deployment ever hits, and inconclusive about which variable
+name was actually read) predates it and was never re-verified against a
+real, already-authenticated profile before now.
 
 *Fix 2 — `access_token` stopped being required at all.* Even with
 injection opt-in, `access_token` was still a required field purely for
@@ -409,24 +464,25 @@ sets `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` and supplies a real per-user JWT.
 
 Set `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` to switch on the other, also-real
 mechanism this harness supports — true per-request token injection,
-overriding whatever profile is on disk. Verified empirically in this
-session, against the real `prod` backend, with a syntactically-plausible
-but fake token:
+overriding whatever profile is on disk — using `MORPHEUS_TOKEN` (see the
+correction above; this used to say `CYBERSIERRA_TOKEN` and cite a since-
+retracted transcript run under a fake `HOME` with no persisted profile,
+which couldn't actually distinguish "the override was read" from "there
+was nothing to fall back to either way"). Re-verified live, against a real,
+already-authenticated profile, with the corrected variable name:
 
 ```
-$ env -i CYBERSIERRA_TOKEN="fake.jwt.token" PATH="..." HOME=/tmp/nonexistent-home cybersierra auth whoami
-{"error":{"code":1,"message":"connect ECONNREFUSED 127.0.0.1:1"}}   # (fake base URL in this test)
-$ env -i PATH="..." HOME=/tmp/nonexistent-home cybersierra auth whoami   # no CYBERSIERRA_TOKEN, no profile
-{"error":{"code":2,"message":"No token for profile \"default\". Run: cybersierra auth login"}}
+$ env -i MORPHEUS_TOKEN="fake.jwt.token" PATH="$PATH" HOME="$HOME" cybersierra auth whoami
+{"error":{"code":2,"message":"Invalid token"}}
 ```
 
-The first call attempted a real network call with the injected token (only
-failing because the test pointed `CYBERSIERRA_BASE_URL` at an unreachable
-address on purpose); the second, with no token anywhere, failed at the
-local config-check stage instead — proving the env var is read and
-prioritized before the local profile, not silently ignored.
+A real per-user JWT here would succeed as that identity instead of this
+rejection — the rejection itself is what proves `MORPHEUS_TOKEN` was read
+and prioritized over the persisted profile (which alone would have
+succeeded, per the "no env var" case in the correction above), not
+silently ignored.
 
-So: **`CYBERSIERRA_TOKEN` injection is the real, verified mechanism a
+So: **`MORPHEUS_TOKEN` injection is the real, verified mechanism a
 shape-B/C multi-tenant deployment would need** (per caller, per call,
 overriding whatever profile happens to be on disk) — it's built, working,
 and covered by `verify/verify_server_multi_session_isolation.py`'s
@@ -439,14 +495,67 @@ the real token from an already-completed `login-browser` session (readable
 from `~/.cybersierra/config.json`'s `token` field, or via `auth whoami`) as
 `access_token` on your request.
 
+**Fix 3 — a second, separate issue this repo's own `CYBERSIERRA_BASE_URL`
+had, now fixed:** this variable (`.env.example`) previously was not
+forwarded to the sandboxed subprocess at all — `harness/agent.py`'s
+`_PASSTHROUGH_ENV_KEYS` only passed through `PATH`/`HOME`, plus the
+conditional `MORPHEUS_TOKEN` injection above; there was no code path that
+read `CYBERSIERRA_BASE_URL` and forwarded it as `MORPHEUS_BASE_URL` (the
+name the real CLI actually checks). This went unnoticed because this dev
+box's own persisted profile already had a correct `baseUrl` cached in it
+from a prior `login-browser`, and the CLI silently fell back to it — but a
+genuinely fresh deployment host, one that's never had a human log in on it
+at all, would have failed every single command with `"No baseUrl
+configured"`, regardless of how correct the forwarded per-user
+`MORPHEUS_TOKEN` was. Caught the same way as Fix 1/2 above: by actually
+emptying the persisted profile and testing, not by reading the code and
+assuming it worked.
+
+Fixed: `_build_agent` now reads `CYBERSIERRA_BASE_URL` and translates it
+into `MORPHEUS_BASE_URL`, injected **unconditionally** — not gated behind
+`CYBERSIERRA_INJECT_ACCESS_TOKEN` the way `MORPHEUS_TOKEN` is, since base
+URL is static, deployment-wide config (the same value for every user), not
+per-request secret data; gating it the same way would silently recreate
+this exact gap for anyone who sets the token toggle but forgets this too.
+Re-verified live, with a genuinely fresh `HOME` (no `~/.cybersierra`
+directory at all, not just an emptied file) and a fake token, through the
+actual harness code path (a real `/chat` call, not a manual shell
+simulation):
+
+```
+$ HOME=<fresh-empty-dir> CYBERSIERRA_BASE_URL=https://morpheus-api.prod.cybersierra.ai/ \
+  CYBERSIERRA_INJECT_ACCESS_TOKEN=1 uvicorn server.app:app
+# /chat asked to run `cybersierra auth whoami` with access_token=fake.jwt.token:
+{"error": {"code": 2, "message": "Invalid token"}}
+```
+
+A real rejection from the backend, not `"No baseUrl configured"` — proving
+base URL resolution no longer depends on any persisted profile existing.
+The model's own final answer to the user, unprompted: *"You'll need to
+sign in again on the CyberSierra platform... let me know and I can
+retry"* — no CLI names, tokens, or internal mechanics mentioned, per the
+new `SYSTEM_PROMPT_APPENDIX` guidance (see `harness/agent.py`) added
+alongside this fix.
+
+This closes the actual requirement behind all three fixes in this section:
+a real deployment (`CYBERSIERRA_BASE_URL` + `CYBERSIERRA_INJECT_ACCESS_TOKEN=1`
++ the tracy proxy's service-auth secret set) needs **zero** persisted
+profile and **zero** interactive login, ever, on any host — the only login
+a real end user ever does is logging into the CyberSierra platform itself.
+The bundled `frontend/index.html` test page is the one legitimate exception
+to all of this: it's a single-developer local-testing convenience that
+still relies on a one-time local `login-browser` and a persisted profile,
+and that's fine — it never forwards a real per-user token in the first
+place, so none of this section's guarantees are claims about that path.
+
 **What `cybersierra` does *not* offer, confirmed by reading `cybersierra
 auth --help` and every subcommand's own `--help` directly:** there is no
 non-interactive way to *acquire* a first token — `login` (email/password)
 and `login-browser` (MFA/SSO) are the only two acquisition paths, and both
 are interactive by design (even `login` needs a password prompt or
-`$CYBERSIERRA_PASSWORD`, not a token exchange). `set-token <jwt>` registers
+`$MORPHEUS_PASSWORD`, not a token exchange). `set-token <jwt>` registers
 an already-acquired token but doesn't get you one. So for a real shape-B/C
-deployment serving many users from one process, `CYBERSIERRA_TOKEN`
+deployment serving many users from one process, `MORPHEUS_TOKEN`
 injection solves the "route the right identity into each call" half of the
 problem, but *acquiring* each user's JWT in the first place is still
 outside what this CLI does for you — that would need a token-exchange step
@@ -484,7 +593,13 @@ run in this session — passes):
 - Layer 1: a denied `touch <marker>` really doesn't create the file (a real
   filesystem side-effect check, not just "no exception"), and gets back
   `exit_code=126`. An allowed command (`cybersierra --version`) really
-  reaches the real binary.
+  reaches the real binary. The entire `cybersierra auth` subcommand group
+  is denied the same way (`poll`/`set-token`/`logout`, not just
+  `login-browser`/`login` — see "Authentication model" for why this widened
+  from two enumerated subcommands to a deny-the-whole-group-by-default
+  posture), with one explicit carve-out (`cybersierra auth whoami`, still
+  allowed) confirmed both by direct denial checks and by asserting
+  `is_command_allowed` itself.
 - Layer 2: run through an **actual compiled DeepAgents graph** (not the
   middleware method called by hand) — a scripted, not live, model
   deterministically attempts a disallowed `execute` call, and the check
@@ -604,7 +719,7 @@ fixed version, from a real run.
 *not* out of the `TextDelta`/`Done` content actually streamed back to the
 caller. That's on purpose: `verify_server_multi_session_isolation.py`'s
 env-isolation check proves per-request token scoping by asking the model
-to echo the injected `CYBERSIERRA_TOKEN` back in its answer — a blanket
+to echo the injected `MORPHEUS_TOKEN` back in its answer — a blanket
 scrub-everywhere policy (which is what the sibling Claude SDK POC does)
 would make that check unable to observe its own result. The caller already
 has their own token (they sent it); what this scrub protects against is

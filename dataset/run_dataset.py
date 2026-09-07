@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import UTC, datetime
@@ -156,7 +157,15 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None, help="Stop after N queries (for a quick smoke run)")
     parser.add_argument("--resume", action="store_true", help="Skip (category, dataset_id, query) triples already present in --output")
     parser.add_argument("--delay", type=float, default=0.0, help="Seconds to sleep between queries (default: 0)")
+    parser.add_argument(
+        "--service-auth",
+        default=os.environ.get("DEEPAGENT_SERVICE_AUTH"),
+        help="X-Service-Auth value for the target server's mandatory service-to-service check "
+        "(default: $DEEPAGENT_SERVICE_AUTH). /chat now 401s without this — see server/app.py.",
+    )
     args = parser.parse_args()
+    if not args.service_auth:
+        parser.error("--service-auth (or $DEEPAGENT_SERVICE_AUTH) is required — /chat rejects unauthenticated callers")
 
     categories = set(args.categories.split(","))
     valid = {"single", "composite", "adversarial"}
@@ -183,7 +192,7 @@ def main() -> int:
         return 1
 
     results: list[dict[str, Any]] = existing["results"]
-    with httpx.Client() as client:
+    with httpx.Client(headers={"X-Service-Auth": args.service_auth}) as client:
         for i, (category, dataset_id, query, expected) in enumerate(to_run, 1):
             print(f"[{i}/{len(to_run)}] ({category}/{dataset_id}) {query!r} ... ", end="", flush=True)
             outcome = _run_one(client, args.base_url, query)

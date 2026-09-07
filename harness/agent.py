@@ -92,6 +92,12 @@ SYSTEM_PROMPT_APPENDIX = (
     "CLI's real command surface (e.g. a manifest or catalog command), run "
     "that discovery step before attempting any other command against that "
     "CLI, and only use commands that discovery step actually returned.\n\n"
+    "If a command's output indicates an invalid, expired, or unauthorized "
+    "credential, do not attempt to log in, re-authenticate, or fix this "
+    "yourself in any way. Tell the user, in plain language, that they need "
+    "to sign in again on the CyberSierra platform -- do not mention any "
+    "command name, environment variable, token, or other internal "
+    "authentication mechanism in that message.\n\n"
     "A discovery command that returns only shallow, high-level results (for "
     "example, top-level category or module names with no further detail) is "
     "not sufficient to act on -- it means you must go one level deeper (e.g. "
@@ -111,9 +117,12 @@ SYSTEM_PROMPT_APPENDIX = (
 _checkpointer = InMemorySaver()
 
 # Passed through to the sandboxed shell backend's subprocess env so
-# `cybersierra`/`npm`/`npx`/`python3` resolve and the CLI's persisted
-# profile (~/.cybersierra/config.json) is found. Nothing else from this
-# process's ambient os.environ crosses into the sandbox — see
+# `cybersierra`/`npm`/`npx`/`python3` resolve. HOME is what makes the CLI's
+# persisted profile (~/.cybersierra/config.json), if one happens to exist,
+# get found -- but a real deployment must not depend on that existing (see
+# MORPHEUS_BASE_URL injection in _build_agent below, which is what makes a
+# host with no persisted profile at all work correctly). Nothing else from
+# this process's ambient os.environ crosses into the sandbox — see
 # harness/sandbox.py and README "Security boundary".
 _PASSTHROUGH_ENV_KEYS = ("PATH", "HOME")
 
@@ -168,21 +177,38 @@ def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None =
 
     Whether `access_token` actually becomes this call's cybersierra
     identity is conditional, and that's a deliberate fix, not the original
-    design: setting `CYBERSIERRA_TOKEN` in the subprocess env
-    *unconditionally* — which this did at first — actively breaks the
-    "already logged in via `cybersierra auth login-browser`" convenience
-    this POC otherwise assumes (see README "Authentication model"),
-    because the real CLI checks `process.env.CYBERSIERRA_TOKEN ?? <persisted
-    profile>` — JS's `??` only falls back on `null`/`undefined`, not on a
-    wrong string, so *any* non-empty value here, including a UI placeholder
-    that was never meant to be a real credential, wins over the already-
-    authenticated profile and gets rejected by the real backend. So: by
-    default, `CYBERSIERRA_TOKEN` is simply never added to this env dict,
-    and the persisted profile from the one-time login resolves normally.
-    Set `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` to opt into the other, also-real
-    mechanism this harness supports — per-request token injection,
-    verified in README to override the persisted profile — for anyone
-    actually running a shape-B/C multi-tenant demo with real per-user JWTs.
+    design: setting the override var in the subprocess env *unconditionally*
+    — which this did at first — actively breaks the "already logged in via
+    `cybersierra auth login-browser`" convenience this POC otherwise assumes
+    (see README "Authentication model"), because the real CLI checks
+    `process.env.MORPHEUS_TOKEN ?? <persisted profile>.token` — JS's `??`
+    only falls back on `null`/`undefined`, not on a wrong string, so *any*
+    non-empty value here, including a UI placeholder that was never meant to
+    be a real credential, wins over the already-authenticated profile and
+    gets rejected by the real backend. So: by default, `MORPHEUS_TOKEN` is
+    simply never added to this env dict, and the persisted profile from the
+    one-time login resolves normally. Set `CYBERSIERRA_INJECT_ACCESS_TOKEN=1`
+    to opt into the other, also-real mechanism this harness supports —
+    per-request token injection, confirmed live against the actual installed
+    CLI binary (see harness/sandbox.py's `MORPHEUS_TOKEN` usage below) — for
+    anyone actually running a shape-B/C multi-tenant demo with real per-user
+    JWTs.
+
+    Correction, not the original design either: earlier versions of this
+    harness (and this repo's README/ARCHITECTURE.md, not yet corrected as of
+    this comment) injected `CYBERSIERRA_TOKEN`, believing that was the CLI's
+    override variable. It isn't — grepping the actual installed
+    `~/.cybersierra/bin/cybersierra` binary shows zero references to
+    `CYBERSIERRA_TOKEN` anywhere in it; the real variable, confirmed both by
+    reading the binary's profile-resolution code and by reproducing live
+    (`MORPHEUS_TOKEN=<garbage> cybersierra auth whoami` gets a real "Invalid
+    token" rejection from the backend; `CYBERSIERRA_TOKEN=<garbage>` against
+    the same command is silently ignored, identical to setting nothing), is
+    `MORPHEUS_TOKEN`. This means `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` was a
+    silent no-op in every prior version of this code — every request kept
+    using the persisted profile regardless of which per-request token was
+    sent. README "Authentication model" needs a correction pass; this
+    docstring and the actual injection below are already fixed.
 
     `access_token` itself is optional now, not required (see
     `server/app.py` and README "Authentication model" — the `no_token` 400
@@ -190,15 +216,60 @@ def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None =
     `~/.cybersierra/config.json` from that one-time login, so there is no
     per-request credential this POC needs to enforce. The `access_token and`
     guard below matters specifically when `CYBERSIERRA_INJECT_ACCESS_TOKEN=1`
-    is set but a caller sends no token: without it, `CYBERSIERRA_TOKEN`
+    is set but a caller sends no token: without it, `MORPHEUS_TOKEN`
     would be set to `""`, which the CLI's `??` fallback treats as a real
     (empty, rejected) value rather than "absent" — silently breaking the
     persisted-profile fallback the same way the original unconditional-
     injection bug did.
     """
     env = {key: os.environ[key] for key in _PASSTHROUGH_ENV_KEYS if key in os.environ}
+
+    # Deployment-wide, not per-request -- unlike MORPHEUS_TOKEN below, this
+    # has nothing to do with which user is calling, so it is never gated by
+    # CYBERSIERRA_INJECT_ACCESS_TOKEN. Read from CYBERSIERRA_BASE_URL (this
+    # repo's own .env.example) and translated into MORPHEUS_BASE_URL -- the
+    # name the real CLI's profile resolution actually reads
+    # (`process.env.MORPHEUS_BASE_URL ?? persistedProfile.baseUrl`), same
+    # translated-injection shape as MORPHEUS_TOKEN just below, mirrored on
+    # purpose. Unconditional so a genuinely fresh deployment host -- one
+    # that has NEVER had a human run `cybersierra auth login-browser` on
+    # it, and so has no ~/.cybersierra/config.json at all -- still resolves
+    # a baseUrl on every single CLI call, instead of silently depending on
+    # a persisted profile nobody guaranteed exists (confirmed live: an
+    # empty/absent profile with no override here fails every command with
+    # "No baseUrl configured", regardless of how correct MORPHEUS_TOKEN is).
+    # `if base_url:` (truthy), not `is not None` -- an empty string here
+    # would be read by the CLI's `??` as a present-but-wrong value, the
+    # same class of bug already found and fixed for MORPHEUS_TOKEN above.
+    # Leaving CYBERSIERRA_BASE_URL unset (as today, by default) preserves
+    # the bundled frontend/index.html local-dev path, which intentionally
+    # still depends on a persisted profile for single-developer testing.
+    base_url = os.environ.get("CYBERSIERRA_BASE_URL")
+    if base_url:
+        env["MORPHEUS_BASE_URL"] = base_url
+    elif os.environ.get(_INJECT_ENV_VAR):
+        logger.warning(
+            "cybersierra_base_url_missing "
+            "CYBERSIERRA_INJECT_ACCESS_TOKEN is set but CYBERSIERRA_BASE_URL is not -- "
+            "every CLI call on a host with no persisted profile will fail with "
+            "'No baseUrl configured'",
+            extra={"event": "cybersierra_base_url_missing"},
+        )
+
     if access_token and os.environ.get(_INJECT_ENV_VAR):
-        env["CYBERSIERRA_TOKEN"] = access_token
+        # MORPHEUS_TOKEN, not CYBERSIERRA_TOKEN -- confirmed by reading the
+        # actual installed CLI binary's profile-resolution code directly
+        # (~/.cybersierra/bin/cybersierra) and reproducing live:
+        # MORPHEUS_TOKEN=<garbage> against `cybersierra auth whoami` gets a
+        # real "Invalid token" rejection from the backend (proves it's read
+        # and would work with a real token); CYBERSIERRA_TOKEN=<garbage>
+        # against the same command is silently ignored and resolves to the
+        # persisted profile instead -- identical output to setting nothing
+        # at all. This repo's docs previously claimed the opposite (see
+        # README "Authentication model" -- that section is now stale and
+        # needs correcting); this was never actually true against a real
+        # CLI install.
+        env["MORPHEUS_TOKEN"] = access_token
 
     backend = AllowlistedShellBackend(
         root_dir=str(PROJECT_ROOT),
@@ -362,6 +433,7 @@ class TextDelta:
 @dataclass
 class ToolUseStarted:
     name: str
+    args: dict[str, Any] | None = None
 
 
 @dataclass
@@ -473,7 +545,7 @@ async def stream(
                             yield TextDelta(text)
                     elif kind == "on_tool_start":
                         tool_calls_seen.append(event["name"])
-                        yield ToolUseStarted(event["name"])
+                        yield ToolUseStarted(event["name"], event["data"].get("input"))
                     elif kind == "on_chat_model_end":
                         num_turns += 1
                         message = event["data"]["output"]

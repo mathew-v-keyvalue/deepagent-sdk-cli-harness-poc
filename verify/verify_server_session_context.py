@@ -26,14 +26,16 @@ import sys
 
 import httpx
 
-from _server_helper import running_server
+from _server_helper import TEST_SERVICE_AUTH, running_server
 
 PLACEHOLDER_TOKEN = "placeholder-token-not-real"
 
 
 async def main() -> int:
     with running_server(port=8099) as base_url:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(
+            timeout=60.0, headers={"X-Service-Auth": TEST_SERVICE_AUTH}
+        ) as client:
             resp1 = await client.post(
                 f"{base_url}/chat",
                 data={"message": "My name is Ada Lovelace.", "access_token": PLACEHOLDER_TOKEN},

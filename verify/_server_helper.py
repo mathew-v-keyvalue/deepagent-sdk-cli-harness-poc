@@ -19,6 +19,13 @@ import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# Every verify_server_*.py script's requests to /chat must carry this as the
+# X-Service-Auth header, matching what running_server() below sets in the
+# subprocess's own env — /chat now fails closed (401) without it (see
+# server/app.py's _verify_service_auth). Arbitrary value; only used by these
+# scripts and the ephemeral subprocess they launch, never a real deployment.
+TEST_SERVICE_AUTH = "verify-scripts-test-secret"
+
 
 @contextlib.contextmanager
 def running_server(port: int = 8098, timeout: float = 20.0, extra_env: dict[str, str] | None = None) -> Iterator[str]:
@@ -29,10 +36,12 @@ def running_server(port: int = 8098, timeout: float = 20.0, extra_env: dict[str,
     *server subprocess only* — e.g. `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` for
     `verify_server_multi_session_isolation.py`'s env-isolation check, which
     needs that opt-in on (see `harness/agent.py`) without turning it on for
-    every other verify script or this process itself.
+    every other verify script or this process itself. `DEEPAGENT_SERVICE_AUTH`
+    is always set to `TEST_SERVICE_AUTH` here (overridable via `extra_env` if
+    a script ever needs to test the auth-rejection path itself).
     """
     base_url = f"http://127.0.0.1:{port}"
-    env = {**os.environ, **(extra_env or {})}
+    env = {**os.environ, "DEEPAGENT_SERVICE_AUTH": TEST_SERVICE_AUTH, **(extra_env or {})}
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "server.app:app", "--port", str(port), "--log-level", "warning"],
         cwd=str(PROJECT_ROOT),

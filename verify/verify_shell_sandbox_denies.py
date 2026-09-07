@@ -49,7 +49,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
 from deepagents import create_deep_agent
-from harness.sandbox import AllowlistedShellBackend, ShellSandboxMiddleware
+from harness.sandbox import AllowlistedShellBackend, ShellSandboxMiddleware, is_command_allowed
 
 MARKER = os.path.join(tempfile.gettempdir(), "verify_shell_sandbox_denies.marker")
 
@@ -95,6 +95,41 @@ def check_backend_layer() -> bool:
         return False
     print(f"PASS (layer 1/backend): allowed command reached the real cybersierra binary: {allowed.output.strip()!r}")
     return True
+
+
+def check_auth_group_denials() -> bool:
+    """The `cybersierra auth` group-deny (added after the fresh-deployment
+    persisted-profile gap): `poll`/`set-token`/`logout` must be denied by
+    the sandbox before any subprocess ever runs (exit_code == DENY_EXIT_CODE,
+    not whatever the real CLI would itself return for a malformed call —
+    that distinction is what proves this was denied, not just failed for
+    its own reasons), while `whoami` must still be explicitly allowed
+    despite matching the same `cybersierra auth` prefix.
+    """
+    from harness.sandbox import DENY_EXIT_CODE
+
+    backend = AllowlistedShellBackend(root_dir=tempfile.mkdtemp(), env={"PATH": os.environ["PATH"]})
+    ok = True
+
+    for denied_command in (
+        "cybersierra auth poll",
+        "cybersierra auth set-token fake.jwt.token",
+        "cybersierra auth logout",
+    ):
+        result = backend.execute(denied_command)
+        if result.exit_code != DENY_EXIT_CODE:
+            print(f"FAIL (auth-group deny): {denied_command!r} was not denied (exit_code={result.exit_code})")
+            ok = False
+        else:
+            print(f"PASS (auth-group deny): {denied_command!r} denied, exit_code={DENY_EXIT_CODE}")
+
+    if not is_command_allowed("cybersierra auth whoami"):
+        print("FAIL (auth-group deny): 'cybersierra auth whoami' is no longer allowed despite the carve-out")
+        ok = False
+    else:
+        print("PASS (auth-group deny): 'cybersierra auth whoami' remains explicitly allowed")
+
+    return ok
 
 
 async def check_middleware_layer() -> bool:
@@ -145,11 +180,12 @@ async def check_middleware_layer() -> bool:
 
 def main() -> int:
     ok_backend = check_backend_layer()
+    ok_auth_group = check_auth_group_denials()
     ok_middleware = asyncio.run(check_middleware_layer())
     if os.path.exists(MARKER):
         os.remove(MARKER)
 
-    if ok_backend and ok_middleware:
+    if ok_backend and ok_auth_group and ok_middleware:
         print("\nPASS: both sandbox enforcement layers deny by default and let allowed commands through")
         return 0
     print("\nFAIL: shell sandbox did not enforce correctly — see above")

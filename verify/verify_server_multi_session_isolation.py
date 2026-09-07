@@ -12,7 +12,7 @@ doesn't assume one), only a real model API key:
    under test is `harness.agent._build_agent`'s per-call `env=` injection
    (see harness/sandbox.py's `AllowlistedShellBackend`), and `python3` is
    itself on the shell allowlist — so we ask each session to run
-   `python3 -c "...os.environ.get('CYBERSIERRA_TOKEN')..."` via the
+   `python3 -c "...os.environ.get('MORPHEUS_TOKEN')..."` via the
    sandboxed `execute` tool and report back exactly what it printed. Two
    concurrent sessions, two distinct marker tokens, and we assert each
    session's final answer contains only its own marker. This is a stronger,
@@ -44,7 +44,7 @@ import uuid
 
 import httpx
 
-from _server_helper import running_server
+from _server_helper import TEST_SERVICE_AUTH, running_server
 
 PORT = 8100
 
@@ -73,7 +73,7 @@ async def check_two_sessions_distinct_env_tokens(client: httpx.AsyncClient, base
     token_b = f"marker-B-{uuid.uuid4().hex[:8]}"
     prompt = (
         "Run exactly this shell command with the execute tool: "
-        "python3 -c \"import os; print('TOKEN_IS_' + os.environ.get('CYBERSIERRA_TOKEN', 'MISSING'))\" "
+        "python3 -c \"import os; print('TOKEN_IS_' + os.environ.get('MORPHEUS_TOKEN', 'MISSING'))\" "
         "Then tell me, in your final answer, exactly what it printed to stdout."
     )
 
@@ -98,7 +98,7 @@ async def check_two_sessions_distinct_env_tokens(client: httpx.AsyncClient, base
         print("FAIL: session A's token leaked into session B's subprocess environment")
         return False
 
-    print("PASS: two concurrent sessions each saw only their own access_token in CYBERSIERRA_TOKEN")
+    print("PASS: two concurrent sessions each saw only their own access_token in MORPHEUS_TOKEN")
     return True
 
 
@@ -164,7 +164,9 @@ async def check_two_sessions_same_token_different_facts(client: httpx.AsyncClien
 
 async def main() -> int:
     with running_server(port=PORT, extra_env={"CYBERSIERRA_INJECT_ACCESS_TOKEN": "1"}) as base_url:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        async with httpx.AsyncClient(
+            timeout=90.0, headers={"X-Service-Auth": TEST_SERVICE_AUTH}
+        ) as client:
             ok1 = await check_two_sessions_distinct_env_tokens(client, base_url)
             ok2 = await check_two_sessions_same_token_different_facts(client, base_url)
 
