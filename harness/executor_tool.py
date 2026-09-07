@@ -40,7 +40,8 @@ from typing import Any
 from langchain_core.tools import tool
 
 from deepagents.backends.protocol import SandboxBackendProtocol
-from harness.tracing import Netra, SpanType
+from harness.sandbox import scrub
+from harness.tracing import Netra, SpanType, trace_content_enabled
 
 # The real CLI invocation for each step is already logged by
 # AllowlistedShellBackend.execute (harness/sandbox.py: cli_call_start/
@@ -210,6 +211,12 @@ def make_run_execution_plan_tool(backend: SandboxBackendProtocol):
                 try:
                     resolved_args = _resolve(step.get("arguments", {}), inputs, step_outputs, step_id)
                     resolved_command = _build_command(step["command"], resolved_args)
+                    if trace_content_enabled():
+                        redact_secret = getattr(backend, "redact_secret", None)
+                        span.set_attribute(
+                            "plan.arguments",
+                            scrub(json.dumps(resolved_args, default=str), redact_secret)[:2000],
+                        )
                 except PlanExecutionError as exc:
                     logger.warning(
                         "plan_step_failed planId=%r stepId=%d error=%r",
@@ -260,6 +267,8 @@ def make_run_execution_plan_tool(backend: SandboxBackendProtocol):
                 )
                 span.set_attribute("plan.exit_code", str(response.exit_code))
                 span.set_attribute("plan.duration_ms", str(round((time.monotonic() - start) * 1000, 1)))
+                if trace_content_enabled():
+                    span.set_attribute("plan.output", scrub(stdout, getattr(backend, "redact_secret", None))[:2000])
 
                 entry = {
                     "stepId": step_id,

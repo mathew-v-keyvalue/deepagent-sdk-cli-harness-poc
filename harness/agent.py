@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +37,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from harness.executor_tool import make_run_execution_plan_tool
 from harness.model import resolve_model
 from harness.sandbox import AllowlistedShellBackend, ShellSandboxMiddleware, scrub
-from harness.tracing import Netra, SpanType
+from harness.tracing import Netra, SpanType, trace_content_enabled
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SKILLS_ROOT = PROJECT_ROOT / "skills"
@@ -246,6 +247,40 @@ async def _log_skills_available(graph: Any, config: dict, access_token: str) -> 
         )
 
 
+class _LlmCallTracker:
+    """Marks each individual model round-trip within a turn — `turn_start`/
+    `turn_done` only bracket the WHOLE multi-round turn, which can include
+    several LLM calls interleaved with several tool calls, and there was no
+    log event for an individual LLM call boundary at all before this. Feeds
+    harness/console_format.py's "🧠 LLM" story beat (and its per-turn call
+    count); the file log gets these as ordinary `llm_call_start`/
+    `llm_call_end` lines like any other event.
+
+    Keyed by the event's own `run_id` rather than a single "last start"
+    variable: LangGraph's ReAct-style loop only ever runs one model call at
+    a time in this harness today, so a single variable would work too, but
+    keying by `run_id` costs almost nothing and stays correct even if that
+    ever changes.
+    """
+
+    def __init__(self) -> None:
+        self._starts: dict[str, float] = {}
+
+    def observe(self, event: dict[str, Any]) -> None:
+        kind = event["event"]
+        if kind == "on_chat_model_start":
+            self._starts[str(event.get("run_id"))] = time.monotonic()
+            logger.info("llm_call_start", extra={"event": "llm_call_start"})
+        elif kind == "on_chat_model_end":
+            start = self._starts.pop(str(event.get("run_id")), None)
+            elapsed_ms = round((time.monotonic() - start) * 1000) if start is not None else None
+            logger.info(
+                "llm_call_end elapsed_ms=%s",
+                elapsed_ms,
+                extra={"event": "llm_call_end", "elapsed_ms": elapsed_ms},
+            )
+
+
 async def run(prompt: str, access_token: str = "") -> str:
     """Run one turn of the agent for one caller and return only its final
     text. Mirrors the Claude POC's `run()` in shape (single-shot, final-
@@ -271,12 +306,22 @@ async def run(prompt: str, access_token: str = "") -> str:
     )
 
     final_text = ""
+    llm_tracker = _LlmCallTracker()
     with Netra.start_span("Agent_Turn", as_type=SpanType.TOOL, module_name="agent") as span:
         span.set_attribute("agent.thread_id", thread_id)
+        Netra.set_session_id(thread_id)
+        if trace_content_enabled():
+            # The dashboard's dedicated Input/Output fields, not a generic
+            # span attribute — resolves against whatever is currently the
+            # root of this trace (see harness/tracing.py's trace_content_enabled
+            # docstring for why this needs its own gate independent of
+            # Netra.init()'s own trace_content setting).
+            Netra.set_root_input(scrub(prompt, access_token))
         try:
             async for event in graph.astream_events(
                 {"messages": [HumanMessage(content=prompt)]}, config, version="v2"
             ):
+                llm_tracker.observe(event)
                 if event["event"] == "on_chat_model_end":
                     message = event["data"]["output"]
                     text = _extract_text(message)
@@ -295,6 +340,8 @@ async def run(prompt: str, access_token: str = "") -> str:
                 thread_id,
                 extra={"event": "turn_done", "thread_id": thread_id},
             )
+            if trace_content_enabled():
+                Netra.set_root_output(scrub(final_text, access_token))
             span.set_attribute("agent.status", "success")
             span.set_success()
         except Exception as exc:  # noqa: BLE001 — re-raised unchanged, span is observability only
@@ -401,6 +448,8 @@ async def stream(
     num_turns = 0
     usage_totals: dict[str, int] = {}
     tool_calls_seen: list[str] = []
+    llm_tracker = _LlmCallTracker()
+    final_text = ""
 
     try:
         graph = _build_agent(access_token)
@@ -408,10 +457,14 @@ async def stream(
         with Netra.start_span("Agent_Turn", as_type=SpanType.TOOL, module_name="agent") as span:
             span.set_attribute("agent.thread_id", thread_id)
             span.set_attribute("agent.is_new_session", str(session_id is not None))
+            Netra.set_session_id(thread_id)
+            if trace_content_enabled():
+                Netra.set_root_input(scrub(prompt, access_token))
             try:
                 async for event in graph.astream_events(
                     {"messages": [HumanMessage(content=prompt)]}, config, version="v2"
                 ):
+                    llm_tracker.observe(event)
                     kind = event["event"]
                     if kind == "on_chat_model_stream":
                         chunk = event["data"]["chunk"]
@@ -424,6 +477,9 @@ async def stream(
                     elif kind == "on_chat_model_end":
                         num_turns += 1
                         message = event["data"]["output"]
+                        text = _extract_text(message)
+                        if text:
+                            final_text = text
                         for key, value in (getattr(message, "usage_metadata", None) or {}).items():
                             if isinstance(value, int):
                                 usage_totals[key] = usage_totals.get(key, 0) + value
@@ -450,6 +506,8 @@ async def stream(
                 span.set_attribute("agent.num_turns", str(num_turns))
                 span.set_attribute("agent.tool_calls", json.dumps(tool_calls_seen))
                 span.set_attribute("agent.usage", json.dumps(usage_totals))
+                if trace_content_enabled():
+                    Netra.set_root_output(scrub(final_text, access_token))
                 span.set_attribute("agent.status", "success")
                 span.set_success()
                 yield Done(

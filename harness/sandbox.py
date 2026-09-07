@@ -55,6 +55,7 @@ not a DeepAgents-specific gap.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -63,7 +64,7 @@ from deepagents.backends.protocol import ExecuteResponse
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import ToolMessage
 
-from harness.tracing import Netra, SpanType
+from harness.tracing import Netra, SpanType, trace_content_enabled
 
 if TYPE_CHECKING:
     from langchain.agents.middleware.types import ToolCallRequest
@@ -205,6 +206,16 @@ class AllowlistedShellBackend(LocalShellBackend):
         super().__init__(*args, **kwargs)
         self._redact = redact
 
+    @property
+    def redact_secret(self) -> str | None:
+        """The current request's access token, if any — exposed so other
+        modules sharing this backend (harness/executor_tool.py's `Plan_Step`
+        span) can scrub the same secret out of anything they attach to a
+        Netra span, the same way this backend already scrubs it from its
+        own `cli_call_*` log lines. Never used to alter what's returned to
+        the tool-call machinery, only what's exported externally."""
+        return self._redact
+
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         with Netra.start_span("CLI_Call", as_type=SpanType.TOOL, module_name="sandbox") as span:
             span.set_attribute("cli.command", scrub(command, self._redact))
@@ -228,12 +239,14 @@ class AllowlistedShellBackend(LocalShellBackend):
                 scrub(command, self._redact),
                 extra={"event": "cli_call_start", "command": scrub(command, self._redact)},
             )
+            start = time.monotonic()
             try:
                 response = super().execute(command, timeout=timeout)
             except Exception as exc:
                 span.set_attribute("cli.status", "error")
                 span.set_error(str(exc))
                 raise
+            duration_ms = round((time.monotonic() - start) * 1000)
             logger.info(
                 "cli_call_done command=%r exit_code=%s truncated=%s output=%r",
                 scrub(command, self._redact),
@@ -246,8 +259,11 @@ class AllowlistedShellBackend(LocalShellBackend):
                     "exit_code": response.exit_code,
                     "truncated": response.truncated,
                     "output_preview": scrub(response.output, self._redact)[:500],
+                    "duration_ms": duration_ms,
                 },
             )
+            if trace_content_enabled():
+                span.set_attribute("cli.output", scrub(response.output, self._redact)[:2000])
             span.set_attribute("cli.exit_code", str(response.exit_code))
             span.set_attribute("cli.truncated", str(response.truncated))
             span.set_attribute("cli.status", "ok" if response.exit_code == 0 else "nonzero_exit")

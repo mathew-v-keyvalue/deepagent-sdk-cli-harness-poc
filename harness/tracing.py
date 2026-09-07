@@ -54,12 +54,43 @@ except ImportError:
         def start_span(cls, *args, **kwargs) -> "_NoOpSpan":
             return _NoOpSpan()
 
+        # harness/agent.py calls these unconditionally too (session grouping,
+        # root input/output) — same "never needs its own conditional logic"
+        # contract as start_span above.
+        @classmethod
+        def set_session_id(cls, *args, **kwargs) -> None:
+            return None
+
+        @classmethod
+        def set_root_input(cls, *args, **kwargs) -> None:
+            return None
+
+        @classmethod
+        def set_root_output(cls, *args, **kwargs) -> None:
+            return None
+
 
 _CONFIGURED = False
 
 
 def _is_truthy(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def trace_content_enabled() -> bool:
+    """Same gate `init_tracing()` passes to `Netra.init(trace_content=...)`
+    for the auto-instrumented LLM spans, exposed here so the three custom
+    spans this harness creates by hand (`Agent_Turn` in harness/agent.py,
+    `Plan_Step` in harness/executor_tool.py, `CLI_Call` in harness/sandbox.py)
+    can honor the identical setting before attaching prompt/response/
+    command-output content to a span — `Netra.init()`'s own `trace_content`
+    has no effect on spans WE create via `Netra.start_span(...)` directly,
+    so without this, those three span types would leak content externally
+    even with `NETRA_TRACE_CONTENT=0`. Read fresh each call (like
+    `harness/model.py`'s `resolve_model()`), not cached, so it stays
+    consistent with whatever `init_tracing()` decided at startup.
+    """
+    return _is_truthy(os.environ.get("NETRA_TRACE_CONTENT", ""))
 
 
 def init_tracing() -> None:
@@ -72,6 +103,10 @@ def init_tracing() -> None:
             stays disabled (same as the reference repo's `server.py` gate).
         NETRA_TRACE_CONTENT — whether captured spans include raw content
             (prompts/outputs) vs. metadata only.
+        NETRA_OTLP_ENDPOINT — read directly by netra-sdk (not this module);
+            without it, netra-sdk silently falls back to a ConsoleSpanExporter
+            and spans print to stdout instead of reaching the Netra
+            dashboard. See .env.example for the shared collector URL.
 
     If `netra-sdk` isn't installed, or either of the two required settings
     above is missing, every `Netra.start_span(...)` call in this harness
@@ -110,6 +145,36 @@ def init_tracing() -> None:
         environment=os.environ.get("PLATFORM_ENV", "development"),
         trace_content=_is_truthy(os.environ.get("NETRA_TRACE_CONTENT", "")),
         instruments={InstrumentSet.FASTAPI, InstrumentSet.LANGCHAIN},
+        # Confirmed by reading the installed opentelemetry-instrumentation-
+        # langchain + deepagents/langgraph source directly, not guessed:
+        # deepagents builds every graph node as a `RunnableCallable(...,
+        # trace=False)` (langchain/agents/factory.py), so node/runnable
+        # wrapper spans never fire in this stack today — the "model"/
+        # "tools"/"*.before_model" etc. entries below are purely defensive,
+        # in case a future deepagents/langgraph version flips that back on.
+        # The one span that DOES fire and IS pure noise: LangGraph's own
+        # top-level compiled-graph span, named "LangGraph" by default
+        # (create_deep_agent() is called with no `name=` in _build_agent
+        # above) — it duplicates our own "Agent_Turn" span below it in the
+        # tree. Blocking it (children reparent onto the surviving ancestor,
+        # nothing is lost) is what actually declutters the dashboard; real
+        # LLM-call spans (named after the model class, e.g. "ChatOpenAI")
+        # and our own Agent_Turn/Plan_Step/CLI_Call spans are untouched.
+        blocked_spans=[
+            "LangGraph",
+            "model",
+            "tools",
+            "*.before_model",
+            "*.after_model",
+            "*.before_agent",
+            "*.after_agent",
+            "RunnableSequence*",
+            "RunnableLambda*",
+            "RunnableBinding*",
+            "RunnableParallel*",
+            "ChatPromptTemplate*",
+            "StrOutputParser*",
+        ],
     )
     logger.info(
         "netra_initialized",
