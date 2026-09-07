@@ -30,7 +30,7 @@ The `cybersierra` CLI is distributed as an npm package: `@cybersierra/cybersierr
 **Before running any `cybersierra` command**, check if it is installed:
 
 ```bash
-which cybersierra || npm list -g @cybersierra/cybersierra-cli
+npm list -g @cybersierra/cybersierra-cli
 ```
 
 If the command is not found or the package is not installed, install it globally:
@@ -171,7 +171,7 @@ The Executor is deterministic runtime logic. It:
 
 1. Ensures the `cybersierra` CLI is available:
    ```bash
-   which cybersierra || npm install -g @cybersierra/cybersierra-cli
+   npm list -g @cybersierra/cybersierra-cli || npm install -g @cybersierra/cybersierra-cli
    ```
    If installation fails, halt and report the error to the user.
 

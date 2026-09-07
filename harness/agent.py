@@ -76,38 +76,28 @@ logger.addHandler(logging.NullHandler())
 # stopping to confirm is a real problem, the right fix is resolving the
 # contradiction inside skills/cyber-sierra/ itself (a disclosed exception to
 # "copied verbatim"), not overriding confirmation behavior from the harness.
+#
+# A fourth addition (2026-09-07): skip any skill-prescribed proactive
+# identity/auth precondition check (e.g. a "whoami"-style command run before
+# every action, independent of any actual failure). Confirmed live in a
+# `/chat` session log that this harness always resolves credentials before
+# the model's turn starts (persisted CLI profile, or the per-request
+# MORPHEUS_TOKEN injection in `_build_agent` below), and `harness/
+# sandbox.py`'s ALLOWED_DESPITE_DENIED_PREFIXES/DENIED_COMMAND_PREFIXES deny
+# the rest of that check's own remediation path (interactive login) anyway
+# — so the proactive check can only ever burn a call/turn, never change the
+# outcome. This is a harness-level override, not a skill edit, since the
+# skill text prescribing it is a verbatim port reused outside this project.
+#
+# The instruction text itself lives in prompts/system_prompt_appendix.md
+# (plain text, one paragraph per blank-line-separated block, loaded verbatim
+# below) so it can be edited without touching this module — the rationale
+# comments above stay here as the audit trail of *why* each paragraph in
+# that file exists; a new paragraph there should get a matching numbered
+# entry here.
 SYSTEM_PROMPT_APPENDIX = (
-    "If an available skill matches the user's request, use it rather than "
-    "answering from general knowledge alone.\n\n"
-    "This environment's tool names differ from the ones referenced inside "
-    "loaded skill files, which were authored for a different agent runtime. "
-    "Map them as follows: `Bash` and `Shell` both mean this environment's "
-    "`execute` tool (same shell-command semantics); `Read` means `read_file` "
-    "(pass limit=1000 for files longer than 100 lines, per the Skills System "
-    "instructions already in this prompt); `Write` means `write_file`.\n\n"
-    "Before running any shell command against a domain CLI referenced by a "
-    "loaded skill, read that skill's full instructions first with read_file "
-    "-- do not guess subcommand names or flags from general knowledge, even "
-    "ones that sound plausible. If the skill describes how to discover the "
-    "CLI's real command surface (e.g. a manifest or catalog command), run "
-    "that discovery step before attempting any other command against that "
-    "CLI, and only use commands that discovery step actually returned.\n\n"
-    "If a command's output indicates an invalid, expired, or unauthorized "
-    "credential, do not attempt to log in, re-authenticate, or fix this "
-    "yourself in any way. Tell the user, in plain language, that they need "
-    "to sign in again on the CyberSierra platform -- do not mention any "
-    "command name, environment variable, token, or other internal "
-    "authentication mechanism in that message.\n\n"
-    "A discovery command that returns only shallow, high-level results (for "
-    "example, top-level category or module names with no further detail) is "
-    "not sufficient to act on -- it means you must go one level deeper (e.g. "
-    "that CLI's own --help on the specific subcommand or category you just "
-    "identified) before trying an actual command, not that you should start "
-    "guessing plausible-sounding subcommand or flag names. If two guesses "
-    "against the same CLI fail in a row, stop guessing and escalate to that "
-    "CLI's own --help instead of trying a third guess; never repeat the "
-    "exact same shallow discovery call more than once without escalating."
-)
+    Path(__file__).resolve().parent / "prompts" / "system_prompt_appendix.md"
+).read_text().strip()
 
 # One checkpointer for the life of this process, shared by every session —
 # this IS the state; server/sessions.py (like the Claude POC's) holds only
