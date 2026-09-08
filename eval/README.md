@@ -22,7 +22,7 @@ eval/
 │   ├── gate_runner.py         # confirm-gate pause-only check
 │   └── scoring.py / score.py  # precision/recall/F1 + auth leak-check, offline
 ├── netra/
-│   ├── dataset.json          # independent Netra-track dataset (13 items)
+│   ├── dataset.json          # independent Netra-track dataset (51 items, all read-only)
 │   ├── setup_dataset.py      # creates/syncs the Netra dataset via SDK
 │   ├── task.py / run.py       # in-process run_test_suite() against harness.agent.run()
 │   ├── run_via_production_hop.py  # PARKED — see "Two things both called 'the Netra track'"
@@ -36,9 +36,10 @@ eval/
 
 `eval/local/dataset.json` and `eval/netra/dataset.json` are deliberately
 **not** the same file, and the Netra one is not generated from the local
-one at runtime — a separate, authored copy (the Netra one happens to be a
-13-item subset captured from the same source at the time this framework
-was built). This is a deliberate choice: it lets each track's dataset
+one at runtime — a separate, authored copy (the Netra one is a 51-item
+mirror of the local dataset's read-only scenarios, scaled up from an
+initial 13-item smoke subset once the pipeline was confirmed working
+end-to-end). This is a deliberate choice: it lets each track's dataset
 evolve independently without one script silently changing what the other
 scores, at the cost of the two occasionally drifting out of sync with each
 other (they don't drift from the *live CLI*, though — see "Keeping this
@@ -64,15 +65,35 @@ score.
 
 ### The Netra SDK has no evaluator-creation API
 
-Checked directly against the installed `netra-sdk` (v0.1.98): it can create
-datasets, dataset items, and test runs, and score *your own* custom
-Python `BaseEvaluator` subclasses locally — but there is **no** API for
-creating or attaching Netra's built-in library evaluators (Answer
-Relevance, Tool Correctness, Toxicity, etc.). That's exclusively an
-MCP-tool or dashboard-UI capability. This Netra instance doesn't support
-MCP (Dynamic Client Registration rejected — `Cannot POST /register`), so
-the one-time evaluator setup is a manual dashboard step — see
+Checked directly against the installed `netra-sdk` — first v0.1.98, then
+re-checked against v1.0.1 after upgrading (see "A real SDK bug, found and
+fixed" below) since a major version bump was a reasonable place for this
+gap to have been closed too. It wasn't: v1.0.1 can create datasets, dataset
+items, and test runs, and score *your own* custom Python `BaseEvaluator`
+subclasses locally — but there is still **no** API for creating or
+attaching Netra's built-in library evaluators (Answer Relevance, Tool
+Correctness, Toxicity, etc.). That's exclusively an MCP-tool or
+dashboard-UI capability. This Netra instance doesn't support MCP (Dynamic
+Client Registration rejected — `Cannot POST /register`), so the one-time
+evaluator setup is a manual dashboard step — see
 `eval/netra/EVALUATOR_SETUP.md`.
+
+### A real SDK bug, found and fixed
+
+`netra-sdk` 0.1.98's `create_dataset()` never sent the `datasetType` field
+the live Netra backend requires — confirmed live: a 400 without it, a 201
+once it's added. Not something fixable in our code; it's the SDK's own
+public API missing a required field entirely. `netra-sdk` 1.0.1 fixes this
+properly (`create_dataset(..., dataset_type=DatasetType.TEXT)`). Checked
+every API surface both this eval framework and the live harness's tracing
+depend on (`Netra.init`, `start_span`, `set_session_id`, `set_root_input`/
+`set_root_output`, `InstrumentSet.FASTAPI`/`LANGCHAIN`, `SpanType`,
+`DatasetItem`/`TurnType`/`Dataset`) before upgrading — all compatible,
+confirmed by importing every `harness.*` and `eval.*` module cleanly after
+the bump. **If you run the live server as a separate long-running process,
+restart it after this upgrade** — `uvicorn --reload` only watches source
+files, not installed dependency versions, so an already-running process
+keeps whatever `netra-sdk` version was loaded at its own startup.
 
 ## Telling eval traffic apart from real frontend traffic in Netra
 
@@ -452,7 +473,7 @@ failures) are excluded from scoring, not counted as wrong answers.
 # One-time (re-runnable) — creates a 3-item smoke dataset in Netra:
 python -m eval.netra.setup_dataset
 # ... then, once you're happy with the smoke results:
-python -m eval.netra.setup_dataset --full     # scale to all 13 items
+python -m eval.netra.setup_dataset --full     # scale to all 51 items
 
 python -m eval.netra.run
 ```
