@@ -1,0 +1,180 @@
+{
+  "_purpose": "Independent Netra-track dataset -- deliberately NOT derived from eval/local/dataset.json at runtime (a separate, authored copy), so the two tracks can diverge on purpose without one script silently changing what the other scores. Same underlying source of truth (the live cybersierra manifest) as the local dataset, just a separate curated selection -- see eval/README.md's 'Two independent dataset definitions' section for why.",
+  "generated_from": {
+    "cli": "cybersierra",
+    "manifest_version": "367f09699890",
+    "captured_via": "cybersierra manifest --raw / cybersierra manifest",
+    "captured_at": "2026-09-03",
+    "total_commands_in_manifest": 37,
+    "note": "The manifest changed between this repo's initial build and this dataset's capture (notifications module and several tprm resources -- activity-logs, assessee-scans, assessee-tenant-users -- were added by a self-update in between). This dataset is a snapshot; see verify/validate_query_dataset.py for drift detection against whatever manifest is live when you run it."
+  },
+  "single_command_queries": [
+    {
+      "id": "health-status-get",
+      "module": "health",
+      "resource": "status",
+      "action": "get",
+      "command": "health status get",
+      "safe": true,
+      "description": "Backend liveness check",
+      "required_params": [],
+      "example_queries": [
+        "Is the Cyber Sierra backend up right now?",
+        "Check system health."
+      ]
+    },
+    {
+      "id": "notifications-feed-list",
+      "module": "notifications",
+      "resource": "feed",
+      "action": "list",
+      "command": "notifications feed list",
+      "safe": true,
+      "description": "List in-app notifications for the caller (filters/paging via --data)",
+      "required_params": [],
+      "example_queries": [
+        "Show me my notifications from the last week.",
+        "List all my assessment-related notifications since May 2026."
+      ],
+      "notes": "Manifest description explicitly warns paging defaults to 10 rows and is a nested {page,limit} object under --data -- worth an example where the Executor/Planner needs to set an explicit limit."
+    },
+    {
+      "id": "notifications-feed-unread-count",
+      "module": "notifications",
+      "resource": "feed",
+      "action": "unread-count",
+      "command": "notifications feed unread-count",
+      "safe": true,
+      "description": "Unread notification count for the caller",
+      "required_params": [],
+      "example_queries": [
+        "How many unread notifications do I have?"
+      ]
+    },
+    {
+      "id": "permissions-policies-list",
+      "module": "permissions",
+      "resource": "policies",
+      "action": "list",
+      "command": "permissions policies list",
+      "safe": true,
+      "description": "List permission policies",
+      "required_params": [
+        "subject"
+      ],
+      "example_queries": [
+        "What permission policies apply to the compliance-auditor role?",
+        "Show me the access policies for the auditor role subject."
+      ],
+      "notes": "subject is required and not obviously a userId or a role name from the description alone -- a good case for the Executor's {{inputs.*}} collection step (contracts.md: 'Collects any unresolved {{inputs.*}} values from the user')."
+    },
+    {
+      "id": "tprm-activity-logs-filter-options",
+      "module": "tprm",
+      "resource": "activity-logs",
+      "action": "filter-options",
+      "command": "tprm activity-logs filter-options",
+      "safe": true,
+      "description": "Valid filter values for activity logs (actors, object types)",
+      "required_params": [
+        "objectType",
+        "objectId"
+      ],
+      "example_queries": [
+        "What filter options are available for activity logs on assessee 118898?"
+      ],
+      "notes": "objectType is an enum (assessee/document/comment) -- a plausible case for the model to get wrong without reading the manifest params carefully."
+    },
+    {
+      "id": "tprm-activity-logs-list",
+      "module": "tprm",
+      "resource": "activity-logs",
+      "action": "list",
+      "command": "tprm activity-logs list",
+      "safe": true,
+      "description": "List assessee/assessment/document activity (filters/paging via --data)",
+      "required_params": [],
+      "example_queries": [
+        "Show me all activity on our vendor records since May 2026.",
+        "What actions has our team taken this month?"
+      ]
+    },
+    {
+      "id": "tprm-assessee-drafts-list",
+      "module": "tprm",
+      "resource": "assessee-drafts",
+      "action": "list",
+      "command": "tprm assessee-drafts list",
+      "safe": true,
+      "description": "List draft assessees",
+      "required_params": [
+        "limit",
+        "page"
+      ],
+      "example_queries": [
+        "List all draft vendors I haven't finished creating yet.",
+        "Show me the vendor drafts still in progress."
+      ]
+    },
+    {
+      "id": "tprm-assessee-scans-list",
+      "module": "tprm",
+      "resource": "assessee-scans",
+      "action": "list",
+      "command": "tprm assessee-scans list",
+      "safe": true,
+      "description": "List security scans for an assessee",
+      "required_params": [
+        "page",
+        "limit",
+        "id"
+      ],
+      "example_queries": [
+        "Show me the security scan results for vendor 118898.",
+        "Are there any new scan findings for vendor 118891 I should know about?"
+      ]
+    }
+  ],
+  "composite_queries": [
+    {
+      "id": "composite-snapshot",
+      "example_query": "Give me a quick compliance snapshot: how many vendors do we have, and what's on the risk dashboard?",
+      "expected_commands": [
+        "tprm assessees count",
+        "tprm dashboard get"
+      ],
+      "notes": "No data dependency between the two steps -- tests that the Planner can produce two independent, parallel-eligible (but still linearly executed, per execution-plan-schema.md's 'strictly linear') steps from one request."
+    },
+    {
+      "id": "composite-identity-and-notifications",
+      "example_query": "Who am I, and how many unread notifications do I have?",
+      "expected_commands": [
+        "user-management me get",
+        "notifications feed unread-count"
+      ]
+    },
+    {
+      "id": "composite-vendor-then-detail",
+      "example_query": "List our vendors, then show me the full details of the first one.",
+      "expected_commands": [
+        "tprm assessees list",
+        "tprm assessees get"
+      ],
+      "notes": "Step 2's id argument should be a {{step[1].*}} reference into step 1's list output -- the canonical case execution-plan-schema.md's Reference Syntax exists for."
+    }
+  ],
+  "adversarial_queries": [
+    {
+      "id": "adversarial-email-report",
+      "example_query": "Email the latest vendor risk report to our CFO.",
+      "expected_behavior": "reject",
+      "reason": "No email/report-delivery command exists anywhere in the manifest. Per planning-rules.md's rejection criteria, this should be rejected outright, not approximated with a partial plan."
+    },
+    {
+      "id": "adversarial-delete-vendor",
+      "example_query": "Delete vendor 118898 entirely from our system.",
+      "expected_behavior": "reject",
+      "reason": "tprm assessees only has create/get/list/count/comments -- no delete action exists in the manifest at all."
+    }
+  ]
+}

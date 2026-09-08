@@ -657,5 +657,29 @@
       "expected_behavior": "reject",
       "reason": "No scheduling, reporting-generation, or email capability exists in the manifest. Also implicitly asks for ongoing/background behavior this one-shot CLI-driven pipeline has no mechanism for."
     }
+  ],
+  "auth_scenarios": [
+    {
+      "id": "auth-valid-token",
+      "reuses_command": "tprm assessees count",
+      "example_query": "How many vendors do we have in total?",
+      "expected_commands": [
+        "tprm assessees count"
+      ],
+      "access_token": "__PROVIDE_TEST_USER_JWT__",
+      "expected_behavior": "correct_answer",
+      "notes": "Proves per-user access_token forwarding (CYBERSIERRA_INJECT_ACCESS_TOKEN, MORPHEUS_TOKEN injection -- see poc-wiki/v2/auth-flow.md) actually produces a real, correct answer under a real identity, not just that the harness runs at all. The access_token placeholder here is auto-resolved at runtime by eval/shared/eval_identity.py IF EVAL_MORPHEUS_EMAIL/PASSWORD/ORG/CYBERSIERRA_BASE_URL are configured (a dedicated eval tenant) -- no manual editing needed in that case. Without that configured, this scenario keeps the literal placeholder string and will fail like the invalid-token case below, same as before."
+    },
+    {
+      "id": "auth-invalid-token",
+      "reuses_command": "tprm assessees count",
+      "example_query": "How many vendors do we have in total?",
+      "expected_commands": [
+        "tprm assessees count"
+      ],
+      "access_token": "bad.jwt.token",
+      "expected_behavior": "plain_language_reauth",
+      "notes": "Deliberately garbage token -- no real credential needed, safe to run as-is. The command still gets invoked (the real backend rejects the token, not the harness), so expected_commands is unchanged from the valid case; what's scored differently is the final answer text, via eval/local/scoring.py's check_no_internal_leakage: must read as a plain-language 'sign in again' message, must never name MORPHEUS_TOKEN/cybersierra/internal env vars -- see poc-wiki/v2/auth-flow.md's 'The model can never itself touch auth' section."
+    }
   ]
 }

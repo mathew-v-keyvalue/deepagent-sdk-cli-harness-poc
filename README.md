@@ -231,40 +231,48 @@ python verify/verify_server_multi_session_isolation.py
 python verify/verify_server_streaming_incremental.py
 ```
 
-### 6. Query dataset drift check
+### 6. Eval framework
 
 ```bash
-python verify/validate_query_dataset.py
+python -m eval.verify_datasets
 ```
 
-`dataset/query_dataset.json` is 51 sample `/chat` queries — one per
-**read-only** `cybersierra` manifest command (32; the manifest's other 5
-commands are writes and were deliberately excluded — see `dataset/README.md`
-"Write operations were removed," since `dataset/run_dataset.py` calls a
-real backend and a write example query would mean every dataset run
-actually creates/sends/submits/updates real data), plus 14 multi-step
-(4 of which chain 3 real commands, not just 2) and 5 deliberately
-unanswerable ones. See `dataset/README.md` for how it was
-built, and two real behavior gaps it caught by actually running it against
-a live server: the model guessing wrong CLI subcommands instead of reading
-the loaded skill first (fixed in `harness/agent.py`'s
-`SYSTEM_PROMPT_APPENDIX`), and health/notifications-style queries never
-triggering the skill at all, because the real `SKILL.md`'s own frontmatter
-`description` doesn't mention those domains as trigger words (left as-is —
-fixing it means editing the ported skill file, a disclosed exception to
-"copied verbatim" that wasn't made unilaterally). `validate_query_dataset.py`
-re-pulls the live manifest and enforces two things: no dataset entry
-drifted (command gone, or `safe` flag changed), and no dataset entry is a
-write operation at all — the latter checked by actually injecting a fake
-write-op entry in this session and confirming the script caught it. No
-model key needed. Run in this session — passes.
+The full eval framework (local + Netra tracks, unified CLI, confirm-gate
+and auth-flow coverage) lives under `eval/` — see `eval/README.md` for the
+complete picture. In short: `eval/local/dataset.json` is 53 sample `/chat`
+queries — one per **read-only** `cybersierra` manifest command (32; the
+manifest's other 5 commands are writes and were deliberately excluded —
+see `eval/README.md` "Write operations were removed," since
+`eval/local/runner.py` calls a real backend and a write example query
+would mean every dataset run actually creates/sends/submits/updates real
+data), plus 14 multi-step (4 of which chain 3 real commands, not just 2),
+5 deliberately unanswerable ones, and 2 auth-flow scenarios (per-request
+`access_token` forwarding — see `eval/README.md`'s "Auth-flow coverage").
+See `eval/README.md` for how it was built, and two real behavior gaps it
+caught by actually running it against a live server: the model guessing
+wrong CLI subcommands instead of reading the loaded skill first (fixed in
+`harness/agent.py`'s `SYSTEM_PROMPT_APPENDIX`), and health/notifications-
+style queries never triggering the skill at all, because the real
+`SKILL.md`'s own frontmatter `description` doesn't mention those domains as
+trigger words (left as-is — fixing it means editing the ported skill file,
+a disclosed exception to "copied verbatim" that wasn't made unilaterally).
+`eval/verify_datasets.py` re-pulls the live manifest and enforces two
+things across all three dataset files: no dataset entry drifted (command
+gone, or `safe` flag changed), and no `eval/local/dataset.json`/
+`eval/netra/dataset.json` entry is a write operation at all (the inverse
+holds for `eval/local/gate_scenarios.json` — its entries must stay write
+operations, or the confirm-gate check tests nothing) — the write-exclusion
+check verified, in the session that built it, by injecting a fake write-op
+entry and confirming the script caught it. No model key needed.
 
-`dataset/run_dataset.py` runs the whole dataset (or a subset) against a
-real, already-running `/chat` endpoint and writes the question/answer
-pairs — full answer text, every tool called, token usage, timing — to
-`dataset/results.json`, with `--resume` support for a long run. This is
-what actually caught both gaps above; see `dataset/README.md` for exact
-usage and the full before/after evidence.
+`python -m eval run --target local` runs the whole dataset (or a subset,
+via `--limit`/`--categories`) against a real, already-running `/chat`
+endpoint, writes the question/answer pairs — full answer text, every tool
+called, token usage, timing — to `eval/results/results.json`, and scores
+them (precision/recall/F1, plus an auth leak-check). `--target netra`
+(direct-service, no eval tenant needed) and `--gate` (confirm-gate
+pause-only check) are also available — see `eval/README.md` for exact
+usage and the full before/after evidence this dataset originally caught.
 
 ## Porting the real pipeline
 

@@ -59,11 +59,11 @@ logger.addHandler(logging.NullHandler())
 # — `execute`, `read_file`, `write_file`; rather than edit the ported skill
 # files, see skills/cyber-sierra/, copied verbatim on purpose as primary
 # source, we bridge the naming gap here), and the "read before guessing" /
-# discovery-escalation lines — added after dataset/README.md's spot-checking
+# discovery-escalation lines — added after eval/README.md's spot-checking
 # caught the model guessing plausible-but-wrong CLI subcommands (`cybersierra
 # vendors list`, `cybersierra get vendors`, ...) instead of reading the
 # loaded skill fully first, even though that skill's own text already says
-# to discover the real command surface before acting (see dataset/README.md
+# to discover the real command surface before acting (see eval/README.md
 # "Observed limitation" for the before/after log evidence).
 #
 # A third addition — telling the model to skip the plan-confirmation step
@@ -126,7 +126,7 @@ _INJECT_ENV_VAR = "CYBERSIERRA_INJECT_ACCESS_TOKEN"
 # LangGraph's own default (25) was silently in effect here -- neither
 # astream_events() call below passed a recursion_limit at all. Confirmed
 # via logs/harness.log as the exact, literal cause of every
-# "Recursion limit of 25 reached" failure in a dataset/run_dataset.py run:
+# "Recursion limit of 25 reached" failure in a eval/local/runner.py run:
 # several turns were mid-discovery (a wrong guess, then --help, then a
 # validation-error-driven pivot to a filter-options lookup) and simply ran
 # out of graph steps one or two calls before the correct final call. Not a

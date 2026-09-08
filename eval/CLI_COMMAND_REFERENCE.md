@@ -9,7 +9,7 @@ surface at all.
 
 **Note on the "Known traps for an agent" section below**: it was originally
 written from source-code reading alone, before `logs/harness.log` from an
-actual `dataset/run_dataset.py` run was available to check against. Once
+actual `eval/local/runner.py` run was available to check against. Once
 that log evidence existed, the real dominant causes of the 8–15-`execute`-call
 runs turned out to be different from what source-reading predicted — see the
 section itself for the corrected, log-confirmed diagnosis and what was fixed
@@ -18,7 +18,7 @@ section itself for the corrected, log-confirmed diagnosis and what was fixed
 GET, the flag-naming inconsistency) are still true and still worth knowing —
 they just weren't what broke these particular runs.
 
-`SAFE` = read-only (`safe:true`, in `dataset/query_dataset.json`). `WRITE` =
+`SAFE` = read-only (`safe:true`, in `eval/local/dataset.json`). `WRITE` =
 mutates real data (`safe:false`, deliberately excluded from the dataset).
 
 ## health
@@ -128,9 +128,9 @@ from the ledger, not generated SQL.
 ## What actually caused the 8–15-`execute`-call runs (log-confirmed, fixed)
 
 The paragraph below this one is the *original* source-reading-only theory
-for why `dataset/results.json` runs were so expensive. It turned out to be
+for why `eval/results/results.json` runs were so expensive. It turned out to be
 wrong about the dominant cause. Once `logs/harness.log` from a real
-`dataset/run_dataset.py` run existed, tracing the actual command sequence
+`eval/local/runner.py` run existed, tracing the actual command sequence
 for every slow/failing entry showed three different, concrete root causes —
 all now fixed in `harness/agent.py`/`harness/sandbox.py`, none of them
 requiring a change to `skills/cyber-sierra/`:
@@ -151,7 +151,7 @@ requiring a change to `skills/cyber-sierra/`:
    confirmed at `logs/harness.log:1829-1834`: two attempts, each timing out
    at the sandbox's own timeout ceiling (120s, then a self-escalated 300s),
    over 7 minutes burned on calls that were always going to fail, long
-   enough to blow past `dataset/run_dataset.py`'s 180s client timeout
+   enough to blow past `eval/local/runner.py`'s 180s client timeout
    (matches the `adversarial-scheduled-report` entry's
    `{"code": "http_error", "message": "timed out"}`). This directly
    contradicts this harness's own documented design (main README

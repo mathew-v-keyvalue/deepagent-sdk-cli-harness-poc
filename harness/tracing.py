@@ -93,9 +93,13 @@ def trace_content_enabled() -> bool:
     return _is_truthy(os.environ.get("NETRA_TRACE_CONTENT", ""))
 
 
-def init_tracing() -> None:
+def init_tracing(app_name: str = "cybersierra-deepagents-poc") -> None:
     """Idempotent, same shape as `configure_logging()` — safe to call from
-    both `server/app.py` and `harness/agent.py`'s `__main__` demo.
+    `server/app.py`, `harness/agent.py`'s `__main__` demo, and
+    `eval/netra/run.py` (with a distinct `app_name` — see that module's own
+    docstring for why eval traces get a different app_name than the live
+    server's, and note that whichever caller runs first in a given process
+    wins, per the idempotent guard below).
 
     Env vars (all optional, all off by default):
         NETRA_TRACING — must be truthy to enable export at all.
@@ -140,7 +144,7 @@ def init_tracing() -> None:
     from netra.instrumentation.instruments import InstrumentSet
 
     Netra.init(
-        app_name="cybersierra-deepagents-poc",
+        app_name=app_name,
         headers=f"x-api-key={api_key}",
         environment=os.environ.get("PLATFORM_ENV", "development"),
         trace_content=_is_truthy(os.environ.get("NETRA_TRACE_CONTENT", "")),
