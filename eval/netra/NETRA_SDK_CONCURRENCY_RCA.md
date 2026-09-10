@@ -172,7 +172,7 @@ isn't safe to share the way this code shares it.
   cause of confirm-gate stalls, and confirm-gate stalls are not the cause
   of these crashes.
 
-## Workaround applied (`eval/netra/run.py`)
+## Workaround applied, 2026-09-09 (superseded — see "Fixed" below)
 
 `run_test_suite()` is now called once per dataset item (a 1-item `Dataset`
 each time) inside a plain Python loop, instead of once with the whole
@@ -190,16 +190,72 @@ Trade-offs accepted:
   10-12 minutes instead of running 5-wide. Acceptable for this POC's
   dataset size; would need revisiting for a much larger dataset.
 
-## Not fixed here
+## Fixed (2026-09-10)
 
-This is a bug in `netra-sdk`'s own concurrency handling — `max_concurrency`
-is not honored, and its `ThreadPoolExecutor`-per-item design creates and
-tears down independent event loops in a way that trips over *some* shared
-async resource (confirmed as a real, live crash pattern; not yet confirmed
-which resource). Not something fixable from this repo beyond avoiding the
-buggy code path. Before reporting upstream to Netra: finish identifying the
-actual shared resource (see the `_checkpointer` lead above) and replace the
-`b2c114d8` trace citation with a verified one, so the report doesn't carry
-an unconfirmed attribution or a mismatched example. Once fixed, the
-workaround above can be reverted back to a single `run_test_suite()` call
-over the whole dataset with real concurrency.
+The shared resource is now confirmed, and a real fix (not the one-at-a-time
+workaround above) is live in `eval/netra/run.py`.
+
+**Confirmed root cause**: not the `_checkpointer` lead above — that's ruled
+out (concurrent tasks never touch the same checkpointer key, and asyncio's
+single-threaded cooperative scheduling means no real corruption risk even
+if they did). The actual shared resource is one layer inside
+`langchain_anthropic`: `_client_utils.py`'s `_get_default_async_httpx_client()`
+is `@lru_cache`-memoized. `harness/model.py`'s `resolve_model()` does build
+a fresh `ChatAnthropic`/`AsyncAnthropic` object per call (confirmed,
+unchanged from this doc's earlier analysis), but every one of those
+"fresh" objects resolves to the *same* cached, process-wide
+`httpx2.AsyncClient` connection pool underneath, since `base_url`/`timeout`/
+`anthropic_proxy` never vary between calls. That pool's `httpcore2`
+lock/event objects (`httpcore2/_synchronization.py`, via `anyio`'s asyncio
+backend) only bind to a specific event loop lazily, on first *contended*
+use (`anyio/_backends/_asyncio.py`'s `Lock` only constructs a loop-bound
+`asyncio.Future` when another task already holds the lock). Under real
+concurrency (multiple independently-created event loops alive at once,
+genuinely contending for the one shared pool), that binding mismatches
+across loops — `RuntimeError: Event loop is closed` /
+`RuntimeError: <asyncio.locks.Event> is bound to a different event loop`.
+Under the one-at-a-time workaround there's never contention (only one task,
+one loop, ever alive), so the same shared client never trips the bug even
+though it's still being reused across items either way — which is exactly
+why the workaround happened to "fix" this without anyone knowing why.
+
+**The fix**: this shared client isn't inherently unsafe — reusing one
+connection pool across many concurrent requests *within a single event
+loop* is the normal, correct way to use an async HTTP client. It only
+breaks across *multiple independent* event loops, which is specifically
+what `_run_test_suite_async`'s `ThreadPoolExecutor`-per-item design creates.
+`eval/netra/run.py` now bypasses `run_test_suite()`/`_run_test_suite_async`
+entirely and instead calls `Evaluation._process_single_item()` (the actual
+per-item pipeline — span creation, `execute_task`, result posting; a plain
+async coroutine with no threading in it, `netra/evaluation/api.py:387-433`)
+directly, scheduled via `asyncio.gather` + `asyncio.Semaphore` under **one**
+persistent event loop we own (`asyncio.run()` once, at the top). Since
+there's only ever one event loop now, the shared `lru_cache`d client is
+safe — and is being used exactly the way it's meant to be. Verified live:
+25/25 items on `cybersierra-morpheus-realistic-25-noconfirm` at
+`--max-concurrency 3`, zero `Event loop is closed`/`AnthropicConnectionError`
+crashes, one shared `runId`, ~353s total (vs. ~10-12 min serial before).
+
+**Netra's own span/session tracking needed no changes** — `netra/tracer.py`'s
+`SessionManager` is built entirely on `contextvars.ContextVar`s (documented
+in-source as thread/task-isolated, copy-on-write), which every `asyncio.Task`
+gets its own fork of automatically — already safe for concurrent tasks in
+one loop.
+
+**Residual risk, deliberately fenced**: the fix depends on 3
+underscore-prefixed internals (`Evaluation._process_single_item`,
+`Evaluation._client`, `EvaluationHttpClient.post_run_status`) verified
+against `netra-sdk==1.0.1`'s actual installed source (not just this doc's
+earlier quotes). `eval/netra/run.py` pins that version and asserts these
+names exist at startup (`_assert_netra_internals_compatible`) — a
+`netra-sdk` upgrade will fail loudly instead of silently reintroducing this
+crash (if their internals changed shape) or silently keeping an
+unnecessary workaround (if they fixed `_run_test_suite_async`'s own
+concurrency, in which case this whole custom runner can be deleted and
+replaced with plain `run_test_suite(max_concurrency=N)` again).
+
+Note for a future upstream report to Netra: the `b2c114d8` trace citation
+under "Evidence" above is still unverified/unreplaced — not needed now
+that the fix is confirmed working from this side, but worth doing before
+filing anything with Netra, so the report doesn't carry a mismatched
+example.

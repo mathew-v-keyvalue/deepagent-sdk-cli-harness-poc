@@ -7,30 +7,39 @@ script's real-production-hop testing is parked (see its own docstring and
 
 Prerequisites:
     - `eval/netra/setup_dataset.py` has been run at least once (creates
-      `.netra_eval_ids.json` with a `dataset_id`).
-    - The Tool Correctness and Answer Relevance evaluators have been created
-      and mapped to this dataset via the Netra dashboard (one-time, manual —
-      see `eval/netra/EVALUATOR_SETUP.md`; this Netra instance doesn't
-      support MCP, so that step can't be scripted the way it could be
-      elsewhere). Running this script before that step just exercises the
-      task/scoring path with no evaluator attached — useful as its own
-      smoke test.
+      `.netra_eval_ids.json` with a `dataset_id`), or pass --dataset-id for
+      a dataset created directly via the Netra MCP tools.
+    - Evaluators are mapped to the dataset/items via the Netra dashboard or
+      MCP tools (`netra_map_evaluator_to_dataset`/`netra_update_dataset_item`)
+      — see `eval/netra/EVALUATOR_SETUP.md`. Running this script before
+      that step just exercises the task path with nothing scored.
+
+Concurrency: this drives the dataset's items through Netra's own per-item
+pipeline (`Evaluation._process_single_item`) directly, under one shared
+`asyncio` event loop and a bounded `asyncio.Semaphore`, instead of calling
+`Netra.evaluation.run_test_suite()` (which internally floors concurrency at
+5 workers and gives each one its own throwaway event loop via
+`asyncio.run()` — unsafe, see `eval/netra/NETRA_SDK_CONCURRENCY_RCA.md`'s
+"Fixed" section for the full root cause and why this approach avoids it).
 
 Usage:
 
     python -m eval.netra.run
+    python -m eval.netra.run --dataset-id <id> --max-concurrency 3
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import importlib.metadata
 import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from netra import Netra
-from netra.evaluation.models import Dataset
 
 from harness.tracing import init_tracing
 
@@ -42,12 +51,86 @@ RUN_NAME = "cybersierra-deepagents-poc-direct-run"
 
 _TRUTHY = {"1", "true", "yes", "y", "on"}
 
+# Pinned deliberately: the concurrent runner below calls three
+# underscore-prefixed Evaluation internals (verified against this exact
+# installed version's source, see NETRA_SDK_CONCURRENCY_RCA.md) instead of
+# the public (but unsafely concurrent) run_test_suite(). A netra-sdk
+# upgrade must re-verify those internals still exist with the same
+# behavior before this runner is trusted again — see
+# _assert_netra_internals_compatible below, which fails loudly rather than
+# silently reintroducing the old crash or silently breaking.
+_EXPECTED_NETRA_SDK_VERSION = "1.0.1"
+
 
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
         sys.exit(f"{name} is required — see .env.example and eval/README.md")
     return value
+
+
+def _assert_netra_internals_compatible() -> None:
+    installed = importlib.metadata.version("netra-sdk")
+    if installed != _EXPECTED_NETRA_SDK_VERSION:
+        sys.exit(
+            f"netra-sdk {installed} is installed, but this concurrent runner's internals were "
+            f"verified against netra-sdk=={_EXPECTED_NETRA_SDK_VERSION} only (see "
+            "eval/netra/NETRA_SDK_CONCURRENCY_RCA.md). Re-check whether Evaluation._process_single_item/"
+            "create_run/_client.post_run_status still exist with the same behavior in the new version "
+            "before running this — an upstream fix to run_test_suite()'s own concurrency may mean this "
+            "whole workaround can be deleted instead."
+        )
+    evaluation = Netra.evaluation
+    missing = [
+        name
+        for name in ("_process_single_item", "create_run", "_client")
+        if not hasattr(evaluation, name)
+    ]
+    if not missing and not hasattr(evaluation._client, "post_run_status"):
+        missing.append("_client.post_run_status")
+    if missing:
+        sys.exit(
+            f"netra.evaluation.Evaluation is missing internal(s) this concurrent runner depends on: "
+            f"{missing!r}. See eval/netra/NETRA_SDK_CONCURRENCY_RCA.md."
+        )
+
+
+async def _run_dataset(
+    dataset_id: str, run_name: str, items: list[Any], max_concurrency: int, task: Any
+) -> dict[str, Any] | None:
+    """Run every item in `items` through Netra's own per-item pipeline
+    concurrently, under one shared event loop and a bounded semaphore —
+    the fix for the run_test_suite() concurrency bug, see module docstring
+    and NETRA_SDK_CONCURRENCY_RCA.md. Reuses Evaluation._process_single_item
+    (span creation, task execution, result posting) exactly as
+    run_test_suite() does internally; only the scheduling differs.
+
+    evaluators=None throughout: this repo never passes SDK-local evaluators
+    to run_test_suite() either — every evaluator here is configured
+    server-side (dashboard/MCP) and triggers automatically once a
+    TestRunItem is posted, so Evaluation._run_evaluators_for_item() (a
+    separate, unused-by-us feature) isn't needed.
+    """
+    evaluation = Netra.evaluation
+    run_id = evaluation.create_run(name=run_name, dataset_id=dataset_id)
+    if not run_id:
+        sys.exit("netra.evaluation.create_run() failed — see logs above.")
+
+    semaphore = asyncio.Semaphore(max_concurrency)
+    completed = 0
+    total = len(items)
+
+    async def process_one(idx: int, item: Any) -> dict[str, Any]:
+        nonlocal completed
+        async with semaphore:
+            result = await evaluation._process_single_item(idx, item, run_id, run_name, task, None)
+        completed += 1
+        print(f"[{completed}/{total}] item {idx + 1} -> status={result.status}")
+        return result.item_entry
+
+    items_result = await asyncio.gather(*(process_one(i, item) for i, item in enumerate(items)))
+    evaluation._client.post_run_status(run_id, "completed")
+    return {"runId": run_id, "items": list(items_result)}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -68,6 +151,13 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help=f"Where to write the run summary JSON (default: {SUMMARY_PATH}).",
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=3,
+        help="How many items to run concurrently (default: 3 — conservative starting point for a "
+        "concurrency-bug workaround, see NETRA_SDK_CONCURRENCY_RCA.md; raise once proven solid).",
     )
     args = parser.parse_args(argv)
 
@@ -104,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     init_tracing(app_name=APP_NAME)
     if not getattr(Netra, "evaluation", None):
         sys.exit("Netra.evaluation failed to initialize — check NETRA_API_KEY/NETRA_OTLP_ENDPOINT/NETRA_TRACING.")
+    _assert_netra_internals_compatible()
 
     print(f"Fetching dataset {dataset_id} ...")
     response = Netra.evaluation.get_dataset(dataset_id)
@@ -118,45 +209,24 @@ def main(argv: list[str] | None = None) -> int:
     # if something's missing.
     from eval.netra.task import run_task
 
-    # One item per Netra.evaluation.run_test_suite() call, never the whole
-    # dataset at once — max_concurrency is NOT honored by netra-sdk 1.0.1
-    # (it floors worker count at 5 regardless), and each worker thread opens
-    # its own event loop via asyncio.run(). Something shared across those
-    # independently-created-and-destroyed event loops isn't safe to touch
-    # concurrently that way — exact resource not yet confirmed, see
-    # eval/netra/NETRA_SDK_CONCURRENCY_RCA.md. Symptom: ~40% of items crash
-    # with "RuntimeError: Event loop is closed" mid-run, silently dropping
-    # real results. Submitting one item at a time means at most one worker
-    # thread/event loop is ever alive, which eliminates the race regardless
-    # of which resource turns out to be at fault.
-    print(f"Running {len(items)} item(s) one at a time under run name {run_name!r} ...")
-    run_ids: list[str] = []
-    per_item_results: list[dict] = []
-    for idx, item in enumerate(items, start=1):
-        item_run_name = f"{run_name}-item-{idx:02d}"
-        print(f"[{idx}/{len(items)}] {item_run_name} ...")
-        result = Netra.evaluation.run_test_suite(
-            name=item_run_name,
-            data=Dataset(items=[item]),
-            task=run_task,
-            max_concurrency=1,
-        )
-        if not result:
-            print(f"  WARN: run_test_suite returned no result for item {idx} — see logged error above, continuing")
-            continue
-        run_id = result["runId"]
-        run_ids.append(run_id)
-        run_results = Netra.evaluation.get_run_results(run_id)
-        per_item_results.append({"runId": run_id, "items": result["items"], "results": run_results})
+    print(
+        f"Running {len(items)} item(s) under run name {run_name!r}, "
+        f"max {args.max_concurrency} concurrent ..."
+    )
+    result = asyncio.run(_run_dataset(dataset_id, run_name, items, args.max_concurrency, run_task))
+    if not result:
+        sys.exit("_run_dataset returned no result — see logged error above.")
+    run_id = result["runId"]
+    run_results = Netra.evaluation.get_run_results(run_id)
 
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps({"runIds": run_ids, "perItem": per_item_results}, indent=2))
+    summary_path.write_text(
+        json.dumps({"runIds": [run_id], "perItem": [{"runId": run_id, "items": result["items"], "results": run_results}]}, indent=2)
+    )
     print(f"Wrote {summary_path}")
     print(
-        f"\n{len(run_ids)}/{len(items)} item(s) completed. Each item is its own Netra test run "
-        f"(names {run_name}-item-01 .. {run_name}-item-{len(items):02d}) — view the dashboard for "
-        "Tool Correctness / Answer Relevance scores (once mapped per eval/netra/EVALUATOR_SETUP.md) "
-        "alongside cost/latency."
+        f"\n{len(result['items'])}/{len(items)} item(s) completed under one Netra test run "
+        f"({run_name!r}, id {run_id}) — view the dashboard for evaluator scores alongside cost/latency."
     )
     return 0
 
