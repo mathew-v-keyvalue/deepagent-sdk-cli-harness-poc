@@ -6,25 +6,25 @@
       "id": "gate-tprm-assessees-create",
       "command": "tprm assessees create",
       "safe": false,
-      "example_query": "Add a new vendor called Acme Test Corp to our vendor list."
+      "example_query": "Add a new vendor called Test assesse to our vendor list."
     },
     {
       "id": "gate-tprm-assessments-send",
       "command": "tprm assessments send",
       "safe": false,
-      "example_query": "Send the security assessment to Acme Test Corp."
+      "example_query": "Send the security assessment to Test assesse."
     },
     {
       "id": "gate-tprm-assessments-submit",
       "command": "tprm assessments submit",
       "safe": false,
-      "example_query": "Submit the completed assessment for Acme Test Corp."
+      "example_query": "Submit the completed assessment for Test assesse."
     },
     {
       "id": "gate-tprm-assessments-update",
       "command": "tprm assessments update",
       "safe": false,
-      "example_query": "Update Acme Test Corp's assessment status to in-review."
+      "example_query": "Update Test assesse's assessment status to in-review."
     },
     {
       "id": "gate-tprm-risk-score-config-update-org",

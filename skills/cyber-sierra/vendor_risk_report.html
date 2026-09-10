@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Vendor Risk Report</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; line-height: 1.6; }
+  h1 { border-bottom: 3px solid #2b6cb0; padding-bottom: 10px; }
+  h2 { color: #2b6cb0; margin-top: 32px; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+  th { background-color: #2b6cb0; color: white; }
+  tr:nth-child(even) { background-color: #f7fafc; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.85em; font-weight: bold; }
+  .badge-warn { background: #fff3cd; color: #856404; }
+  .badge-danger { background: #f8d7da; color: #721c24; }
+  .badge-ok { background: #d4edda; color: #155724; }
+  .callout { background: #fff3cd; border-left: 4px solid #f0ad4e; padding: 12px 16px; margin: 16px 0; }
+  .callout-danger { background: #f8d7da; border-left: 4px solid #dc3545; }
+  ul { padding-left: 22px; }
+  footer { margin-top: 40px; font-size: 0.85em; color: #666; border-top: 1px solid #eee; padding-top: 12px; }
+</style>
+</head>
+<body>
+
+<h1>Vendor Risk Report</h1>
+<p><em>Generated from live Cyber Sierra TPRM API data.</em></p>
+
+<h2>Summary</h2>
+<p>
+This tenant currently has <strong>1 vendor (assessee) on file</strong> and
+<strong>0 active third-party risk assessments</strong> returned by the assessments API at this time.
+Organization-level risk scoring thresholds are <span class="badge badge-warn">NOT CONFIGURED</span>
+(all risk band min/max values are 0), and the assessment dashboard endpoint is currently
+<span class="badge badge-danger">INACCESSIBLE (Permission Error)</span>.
+</p>
+
+<h2>Vendors (Assessees) on File</h2>
+<table>
+  <tr>
+    <th>Company</th><th>Country</th><th>Point of Contact</th><th>Contact Email</th><th>Status</th><th>Assessment Sent?</th>
+  </tr>
+  <tr>
+    <td>Test assesse</td><td>India</td><td>Mathew</td><td>mathew.v@keyvalue.systems</td><td>Added</td><td>Yes</td>
+  </tr>
+</table>
+
+<h2>Assessments</h2>
+<div class="callout">
+No assessments were returned by the live assessments API (<code>tprm assessments list</code>) at the time of this
+report, despite the vendor above being flagged as having had an assessment sent
+(<code>isAssessmentSent: true</code>). This could mean the assessment has since been completed/archived, or that
+it falls outside the current query's visibility. Recommend verifying directly in the Cyber Sierra dashboard if a
+specific assessment ID is expected.
+</div>
+
+<h2>Risk Scoring Configuration</h2>
+<p>Org-level risk scoring (<code>tprm risk-score-config get-org</code>) is present but
+<strong>not yet calibrated</strong>:</p>
+<ul>
+  <li>Question compliance score buckets (compliant, non-compliant, partially compliant, etc.) are all set to 0.</li>
+  <li>Risk level bands (satisfactory / inadequate / unsatisfactory) all have min = 0, max = 0.</li>
+</ul>
+<div class="callout">
+<strong>No vendors currently fall into a meaningfully differentiated risk tier</strong> because these thresholds
+haven't been set. This should be addressed before the board report can convey a real risk distribution.
+</div>
+
+<h2>Data Not Available</h2>
+<div class="callout callout-danger">
+<strong>Assessment dashboard summary</strong> (<code>tprm dashboard get</code>) could not be retrieved — the API
+returned a <strong>Permission Error</strong>. This looks like an access/role restriction on this endpoint rather
+than an authentication problem; report to your Cyber Sierra admin if dashboard-level metrics are needed.
+</div>
+
+<h2>Next Steps</h2>
+<ul>
+  <li>Confirm with the platform whether the previously-tracked assessment (vendor: Test assesse) is complete, withdrawn, or simply not visible via this query.</li>
+  <li>Calibrate org-level risk score bands so vendors are classified into meaningful risk tiers.</li>
+  <li>Add more vendors and send assessments to build out a broader risk picture.</li>
+  <li>Request dashboard/report permissions if aggregate risk metrics are needed going forward.</li>
+  <li><strong>Recurring delivery to the board:</strong> the Cyber Sierra CLI has no built-in scheduler or email-send action for reports. To make this monthly, either (a) configure a recurring report/notification inside the Cyber Sierra web app if that feature exists there, or (b) have this report regenerated on a monthly cadence (e.g., a calendar reminder) and forward it to the board manually.</li>
+</ul>
+
+<footer>
+This report reflects live data pulled directly from the Cyber Sierra TPRM API. It supersedes the previous version of this file.
+</footer>
+
+</body>
+</html>

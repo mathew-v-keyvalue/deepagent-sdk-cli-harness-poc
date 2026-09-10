@@ -57,7 +57,7 @@ different blockers:
 
 `eval/netra/run.py` calls `harness.agent.run()` directly, in-process — no
 running server, no HTTP hop, no eval tenant. It still produces real
-`Agent_Turn`/`Plan_Step`/`CLI_Call` spans (via the same `Netra.init()` call
+`Agent_Turn`/`Plan_Step`/`cli_call` spans (via the same `Netra.init()` call
 `harness/tracing.py`'s `init_tracing()` already makes for the live server,
 just under a distinct `app_name` so eval traces stay visually separable in
 the dashboard), so Tool Correctness still has real `trace.tools` data to

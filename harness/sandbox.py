@@ -236,8 +236,14 @@ class AllowlistedShellBackend(LocalShellBackend):
         return self._redact
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
-        with Netra.start_span("CLI_Call", as_type=SpanType.TOOL, module_name="sandbox") as span:
+        with Netra.start_span("cli_call", as_type=SpanType.TOOL, module_name="sandbox") as span:
             span.set_attribute("cli.command", scrub(command, self._redact))
+            # Generic input/output, alongside the cli.* attributes above/below —
+            # SpanWrapper has no set_input()/set_output() (only Netra.set_root_input/
+            # output exist, and those only ever target the trace's root span), so this
+            # is the only way this hand-created span's content shows up under the
+            # dashboard's standard input/output fields rather than only as cli.*.
+            span.set_attribute("input", scrub(command, self._redact))
 
             if not is_command_allowed(command):
                 logger.warning(
@@ -246,6 +252,7 @@ class AllowlistedShellBackend(LocalShellBackend):
                     extra={"event": "cli_call_denied", "command": scrub(command, self._redact)},
                 )
                 span.set_attribute("cli.status", "denied")
+                span.set_attribute("output", scrub(_denial_message(command), self._redact))
                 span.set_success()
                 return ExecuteResponse(
                     output=_denial_message(command),
@@ -283,6 +290,7 @@ class AllowlistedShellBackend(LocalShellBackend):
             )
             if trace_content_enabled():
                 span.set_attribute("cli.output", scrub(response.output, self._redact)[:2000])
+                span.set_attribute("output", scrub(response.output, self._redact)[:2000])
             span.set_attribute("cli.exit_code", str(response.exit_code))
             span.set_attribute("cli.truncated", str(response.truncated))
             span.set_attribute("cli.status", "ok" if response.exit_code == 0 else "nonzero_exit")

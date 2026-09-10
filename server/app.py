@@ -66,7 +66,7 @@ configure_logging()  # see harness/observability.py — this is what makes
 # running `uvicorn server.app:app`, not just when embedded in a script
 # that configures its own logging.
 init_tracing()  # see harness/tracing.py — no-op unless NETRA_TRACING and
-# NETRA_API_KEY are both set; enables the CLI_Call/Plan_Step/Agent_Turn spans.
+# NETRA_API_KEY are both set; enables the cli_call/Plan_Step/Agent_Turn spans.
 
 app = FastAPI(title="cybersierra chat server (DeepAgents POC)")
 

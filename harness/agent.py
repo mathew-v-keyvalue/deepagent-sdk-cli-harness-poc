@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -98,6 +99,31 @@ logger.addHandler(logging.NullHandler())
 SYSTEM_PROMPT_APPENDIX = (
     Path(__file__).resolve().parent / "prompts" / "system_prompt_appendix.md"
 ).read_text().strip()
+
+# Mirrors eval/local/scoring.py's `_CYBERSIERRA_COMMAND_PATTERN` — catches a
+# model bypassing `run_execution_plan` and invoking `cybersierra <module>
+# <resource> <action>` directly via a raw shell/`execute` call. Not reachable
+# today (only `run_execution_plan` is bound as a tool below), but kept in
+# lockstep with the local eval track's already-proven extraction logic so a
+# future tool-binding change doesn't silently reopen the same gap that track
+# hit once already.
+_CYBERSIERRA_COMMAND_PATTERN = re.compile(r"\bcybersierra\s+([a-z][\w-]*)\s+([a-z][\w-]*)\s+([a-z][\w-]*)\b")
+
+
+def _extract_plan_commands(plan_json: str | None) -> list[str]:
+    """Best-effort extraction of every step's bare `command` string from a
+    `run_execution_plan` call's `plan_json` argument. A malformed/missing
+    plan contributes no commands rather than raising — a bad plan is a real
+    (if rare) model failure mode, not a reason to crash the turn.
+    """
+    if not plan_json:
+        return []
+    try:
+        plan = json.loads(plan_json)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [step["command"] for step in plan.get("steps", []) if step.get("command")]
+
 
 # One checkpointer for the life of this process, shared by every session —
 # this IS the state; server/sessions.py (like the Claude POC's) holds only
@@ -368,6 +394,7 @@ async def run(prompt: str, access_token: str = "") -> str:
 
     final_text = ""
     llm_tracker = _LlmCallTracker()
+    actual_commands_seen: list[str] = []
     with Netra.start_span("Agent_Turn", as_type=SpanType.TOOL, module_name="agent") as span:
         span.set_attribute("agent.thread_id", thread_id)
         Netra.set_session_id(thread_id)
@@ -388,6 +415,16 @@ async def run(prompt: str, access_token: str = "") -> str:
                     text = _extract_text(message)
                     if text:
                         final_text = text
+                elif event["event"] == "on_tool_start":
+                    tool_input = event["data"].get("input") or {}
+                    if event["name"] == "run_execution_plan":
+                        actual_commands_seen += _extract_plan_commands(tool_input.get("plan_json"))
+                    elif event["name"] == "execute":
+                        shell_command = tool_input.get("command")
+                        if isinstance(shell_command, str):
+                            match = _CYBERSIERRA_COMMAND_PATTERN.search(shell_command)
+                            if match:
+                                actual_commands_seen.append(" ".join(match.groups()))
 
             # Only meaningful AFTER the graph has actually run at least once on
             # this thread: SkillsMiddleware populates `skills_metadata` via its
@@ -397,12 +434,19 @@ async def run(prompt: str, access_token: str = "") -> str:
             await _log_skills_available(graph, config, access_token)
 
             logger.info(
-                "turn_done thread_id=%s",
+                "turn_done thread_id=%s actual_commands=%r",
                 thread_id,
-                extra={"event": "turn_done", "thread_id": thread_id},
+                actual_commands_seen,
+                extra={"event": "turn_done", "thread_id": thread_id, "actual_commands": actual_commands_seen},
             )
             if trace_content_enabled():
                 Netra.set_root_output(scrub(final_text, access_token))
+            # Raw list[str], not json.dumps-encoded — see the identical attribute
+            # in stream() below for why (Netra expression mapping reads this as
+            # an array variable directly). This is the signal the Netra eval
+            # track's Tool Correctness evaluator reads via
+            # spans[?name=='Agent_Turn'] | [0].agent.actual_commands.
+            span.set_attribute("agent.actual_commands", actual_commands_seen)
             span.set_attribute("agent.status", "success")
             span.set_success()
         except Exception as exc:  # noqa: BLE001 — re-raised unchanged, span is observability only
@@ -510,6 +554,7 @@ async def stream(
     num_turns = 0
     usage_totals: dict[str, int] = {}
     tool_calls_seen: list[str] = []
+    actual_commands_seen: list[str] = []
     llm_tracker = _LlmCallTracker()
     final_text = ""
 
@@ -535,6 +580,15 @@ async def stream(
                             yield TextDelta(text)
                     elif kind == "on_tool_start":
                         tool_calls_seen.append(event["name"])
+                        tool_input = event["data"].get("input") or {}
+                        if event["name"] == "run_execution_plan":
+                            actual_commands_seen += _extract_plan_commands(tool_input.get("plan_json"))
+                        elif event["name"] == "execute":
+                            shell_command = tool_input.get("command")
+                            if isinstance(shell_command, str):
+                                match = _CYBERSIERRA_COMMAND_PATTERN.search(shell_command)
+                                if match:
+                                    actual_commands_seen.append(" ".join(match.groups()))
                         yield ToolUseStarted(event["name"], event["data"].get("input"))
                     elif kind == "on_chat_model_end":
                         num_turns += 1
@@ -552,22 +606,32 @@ async def stream(
                 await _log_skills_available(graph, config, access_token)
 
                 logger.info(
-                    "turn_done thread_id=%s num_turns=%d tool_calls=%r usage=%r",
+                    "turn_done thread_id=%s num_turns=%d tool_calls=%r usage=%r actual_commands=%r",
                     thread_id,
                     num_turns,
                     tool_calls_seen,
                     usage_totals,
+                    actual_commands_seen,
                     extra={
                         "event": "turn_done",
                         "thread_id": thread_id,
                         "num_turns": num_turns,
                         "tool_calls": tool_calls_seen,
                         "usage": usage_totals,
+                        "actual_commands": actual_commands_seen,
                     },
                 )
                 span.set_attribute("agent.num_turns", str(num_turns))
                 span.set_attribute("agent.tool_calls", json.dumps(tool_calls_seen))
                 span.set_attribute("agent.usage", json.dumps(usage_totals))
+                # Raw list[str], not json.dumps-encoded like the attributes
+                # above — deliberately, so Netra's eval expression mapping
+                # (eval/netra/EVALUATOR_SETUP.md) can read this as an array
+                # variable without needing a JSON-string parse step. This is
+                # the single unambiguous "what did the agent actually invoke"
+                # signal for the Netra eval track, mirroring
+                # eval/local/scoring.py's extract_actual_commands().
+                span.set_attribute("agent.actual_commands", actual_commands_seen)
                 if trace_content_enabled():
                     Netra.set_root_output(scrub(final_text, access_token))
                 span.set_attribute("agent.status", "success")

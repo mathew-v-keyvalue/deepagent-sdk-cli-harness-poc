@@ -18,7 +18,7 @@ calling `harness.agent.run()` in-process.
 the call crosses a real HTTP hop into a separate process (morpheus_backend)
 before reaching deepagent, OTEL trace context does NOT propagate for free
 the way it would for an in-process call — `Agent_Turn`/`Plan_Step`/
-`CLI_Call` spans would land in their own disconnected trace, invisible to
+`cli_call` spans would land in their own disconnected trace, invisible to
 whatever `tool_accuracy` evaluator later reads `trace.tools` off THIS run's
 `TestRun.*` span. `task()` below explicitly injects the current OTEL
 context (`opentelemetry.propagate.inject`) into the outbound request
@@ -40,7 +40,7 @@ Prerequisites (see eval/README.md and the original v2 plan's B0/B4):
 Verifying trace linkage (do this once, on the smoke dataset, before
 creating the evaluator): run this script, take the printed `trace_id` for
 one item, and pull it with Netra MCP (`netra_get_trace_by_id`) or the
-dashboard — `Agent_Turn`/`Plan_Step`/`CLI_Call` spans must appear in the
+dashboard — `Agent_Turn`/`Plan_Step`/`cli_call` spans must appear in the
 SAME trace as the `TestRun.*` span. If they don't, the evaluator will
 silently see zero tools for every item — `eval/local/score.py` (which reads
 the SSE capture directly, not `trace.tools`) stays correct regardless,
@@ -150,7 +150,7 @@ def _make_task(env: _Env, session: _MorpheusSession):
     def task(input_data: Any) -> dict[str, Any]:
         headers: dict[str, str] = {}
         # The concrete fix for the plan's B3 cross-process trace-linkage
-        # risk: without this, Agent_Turn/Plan_Step/CLI_Call spans on the
+        # risk: without this, Agent_Turn/Plan_Step/cli_call spans on the
         # deepagent side start a brand-new, disconnected trace instead of
         # continuing this TestRun's trace.
         propagate.inject(headers)
@@ -239,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {SUMMARY_PATH}")
     print(
         "\nNext: pull one item's trace_id from the summary above and confirm "
-        "Agent_Turn/Plan_Step/CLI_Call spans appear in the same trace as this "
+        "Agent_Turn/Plan_Step/cli_call spans appear in the same trace as this "
         "run's TestRun.* span (netra_get_trace_by_id or the dashboard) before "
         "creating/trusting the tool_accuracy evaluator — see this script's docstring."
     )

@@ -81,7 +81,7 @@ def trace_content_enabled() -> bool:
     """Same gate `init_tracing()` passes to `Netra.init(trace_content=...)`
     for the auto-instrumented LLM spans, exposed here so the three custom
     spans this harness creates by hand (`Agent_Turn` in harness/agent.py,
-    `Plan_Step` in harness/executor_tool.py, `CLI_Call` in harness/sandbox.py)
+    `Plan_Step` in harness/executor_tool.py, `cli_call` in harness/sandbox.py)
     can honor the identical setting before attaching prompt/response/
     command-output content to a span — `Netra.init()`'s own `trace_content`
     has no effect on spans WE create via `Netra.start_span(...)` directly,
@@ -163,7 +163,7 @@ def init_tracing(app_name: str = "cybersierra-deepagents-poc") -> None:
         # tree. Blocking it (children reparent onto the surviving ancestor,
         # nothing is lost) is what actually declutters the dashboard; real
         # LLM-call spans (named after the model class, e.g. "ChatOpenAI")
-        # and our own Agent_Turn/Plan_Step/CLI_Call spans are untouched.
+        # and our own Agent_Turn/Plan_Step/cli_call spans are untouched.
         blocked_spans=[
             "LangGraph",
             "model",
