@@ -159,6 +159,13 @@ def main(argv: list[str] | None = None) -> int:
         help="How many items to run concurrently (default: 3 — conservative starting point for a "
         "concurrency-bug workaround, see NETRA_SDK_CONCURRENCY_RCA.md; raise once proven solid).",
     )
+    parser.add_argument(
+        "--item-id",
+        action="append",
+        default=None,
+        help="Dataset item id to run (repeatable) instead of the whole dataset — a smoke test before "
+        "committing to a full run. Default: run every item in the dataset.",
+    )
     args = parser.parse_args(argv)
 
     run_name = args.run_name or RUN_NAME
@@ -201,6 +208,11 @@ def main(argv: list[str] | None = None) -> int:
     if not response or not response.items:
         sys.exit(f"Netra.evaluation.get_dataset({dataset_id!r}) returned no items.")
     items = list(response.items)
+    if args.item_id:
+        wanted = set(args.item_id)
+        items = [item for item in items if getattr(item, "id", None) in wanted]
+        if not items:
+            sys.exit(f"No items in dataset {dataset_id!r} matched --item-id {sorted(wanted)!r}.")
     print(f"{len(items)} item(s) loaded.")
 
     # Imported here, not at module top: harness.agent (transitively) reads

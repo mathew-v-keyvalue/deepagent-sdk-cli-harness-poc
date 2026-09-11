@@ -168,3 +168,70 @@ above that (e.g. 1.5–2x) purely to catch a severe regression — not as a
 the same way any performance regression gate gets tuned. This isn't a
 Netra gap specifically — no regression threshold is meaningful before
 there's stable data to set it from.
+
+---
+
+## Update (2026-09-11) — Correct Rejection removed, CLI Correctness consolidated, 3 "USE now" evaluators added
+
+Everything in this section reflects the live project state as of today, superseding the
+stale "22 evaluators" / "zero llm-as-judge evaluators" account-check snapshot above (that
+was already outdated before today's changes too).
+
+**Removed:** `Correct Rejection (No Tools Called)` — not required. Deleted directly via the
+Netra dashboard's "My Evaluators" section (no `netra_delete_evaluator` MCP tool exists, same
+constraint noted in `EVALUATOR_CLEANUP.md`). Its 5 item-level overrides (on the confirm-gate/
+adversarial items) were separately cleared via `netra_update_dataset_item(evaluators=[])` —
+deleting the evaluator record alone does not clear item-level override pointers, they're
+independent state.
+
+**Consolidated:** both dead "CLI Correctness — actual vs expected commands" / "...v2"
+evaluators were deleted (rather than renamed) — the one evaluator that was actually working,
+previously called "Custom Cli Check Eval" (a `code`-type evaluator active on the
+`-noconfirm` dataset), was renamed to **"CyberSierra CLI Correctness (Dataset-Level)
+Evaluator"** instead. One clear, honestly-named evaluator instead of three overlapping ones.
+
+**Added, verified working (real scores, `provider_id` config confirmed present each time):**
+- **Topic Adherence** (`dcc906e9-d0a4-443c-8814-d54c7095cf7b`) — item-level override on
+  `ba6e19ea-...` (bypass-confirmation) only, with `agent_system_prompt` populated from the
+  real constraint text in `skills/cyber-sierra/SKILL.md` (Step 4 "Present Plan & Confirm" +
+  "Boundaries" sections), not left unmapped.
+- **Plan Quality** (`d2851bf1-a8d7-4e41-8843-956128e70584`) — item-level override on all 5
+  confirm-gate items.
+- Both confirmed via live single-item test runs with real, non-null scores and reasoning
+  (e.g. Plan Quality 0.5/failed with "Plan lacks concrete steps..." — a real judgment, not a
+  config error).
+
+**Added, then dropped — `spans`-rooted mapping broken for `llm-as-judge`:** **Hallucination**
+(`fd7fd645-3e6e-4479-9c52-f7a82fb36dc4`) was created and mapped (dataset-wide, plus on the 5
+confirm-gate items) to check the final answer against real CLI output via a new
+`retrieved_context` variable. New harness instrumentation was added to support it (see
+below) — `agent.actual_outputs`, verified correct on multiple live traces. But every
+`spans`-rooted mapping expression tried for `retrieved_context` resolved to null at eval
+time, while the *identical* variable mapped to `taskOutput` instead resolved correctly
+(control test, isolated via a cheap no-agent-cost debug harness — see
+`NETRA_SDK_EXPRESSION_ENGINE_RCA.md`'s 2026-09-11 addendum for the full isolation, including
+ruling out the `bucket: user_provided` tag as the cause). This conclusively points at a
+platform-side bug specific to `spans`-rooted variables on `llm-as-judge` evaluators, not this
+harness's instrumentation or expression syntax. **Decision: dropped, not shipped** —
+Hallucination is deactivated dataset-wide and removed from all item-level overrides. Topic
+Adherence and Plan Quality (neither depends on `spans`) shipped as planned. Revisit once
+Netra confirms whether this is a known/fixable platform issue.
+
+**Separately, unrelated:** mid-investigation, the org's configured Anthropic provider
+(`providerConfigurationId 2bdcd1e9-9eb2-4d4e-9421-de842419a0d6`) ran out of API credits
+server-side (`400: Your credit balance is too low`) — this blocks *all* `llm-as-judge`
+evaluators (including the now-working Topic Adherence/Plan Quality) until recharged by the
+account owner. This key lives in Netra's own dashboard (Settings → Providers), separate from
+this repo's `.env` `ANTHROPIC_API_KEY` (which only powers the agent under test, not the
+judge) — a real point of confusion worth flagging to whoever manages Netra billing.
+
+**New harness instrumentation (`harness/agent.py`):** a parallel `agent.actual_outputs`
+list[str] attribute on the `Agent_Turn` span, mirroring the existing `agent.actual_commands`
+attribute — accumulated via a new `on_tool_end` handler (there was none before; only
+`on_tool_start` existed). Investigating this surfaced a stale assumption in the codebase's
+own comments: they claimed only `run_execution_plan` is reachable ("not reachable today" for
+raw `execute` calls) — live traces confirm the opposite is true today. The model calls
+`execute` (raw shell) directly, not `run_execution_plan`, so the real fix captures `execute`'s
+`ToolMessage.content` (already plain CLI stdout text) directly; the `run_execution_plan`
+branch is kept for symmetry/future-proofing via the existing JSON-envelope-parsing
+`_extract_plan_outputs()` helper, in case that tool is ever actually invoked.

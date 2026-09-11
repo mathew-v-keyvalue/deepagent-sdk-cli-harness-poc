@@ -96,7 +96,15 @@ actual_tools   → spans[?name=='Agent_Turn'] | [0].agent.actual_commands
 expected_tools → metadata.tools   (unchanged)
 ```
 
-### Added: Correct Rejection (No Tools Called)
+### Added: Correct Rejection (No Tools Called) — REMOVED 2026-09-11, not required
+
+**This whole evaluator was deleted on 2026-09-11** (not required — see
+`EVALUATOR_FINDINGS.md`'s 2026-09-11 update and `EVALUATOR_CLEANUP.md`'s
+2026-09-11 update for the full story). The section below is kept as
+historical record of why it was added in the first place; do not recreate
+it without re-reading that rationale.
+
+### (historical) Added: Correct Rejection (No Tools Called)
 
 New evaluator, id `30c68bc5-f50c-44b3-a33c-3d2292cdc349`, type `regex`
 (rule-based, no LLM provider needed), `config.pattern: "^(\\[\\]|)$"`,
@@ -120,32 +128,42 @@ not add to them:
 - `8a02e67c-7be1-42cf-9574-c3e70b739519` (governance-policy-ack)
 - `c40383bc-a207-4d8c-ae90-b86c2f43b84e` (scanning-jira-ticket)
 
-### Blocked: Answer Relevance (dataset-wide) + Topic Adherence (bypass-confirmation item)
+### Blocked: Answer Relevance (dataset-wide) + Topic Adherence (bypass-confirmation item) — resolved 2026-09-11
 
 `netra_get_default_llm_configuration` returned `null` (no default LLM
 provider configured for this organisation) as of 2026-09-09, which blocks
 creating any `llm-as-judge` evaluator (Important Rule 14/29 — creation
-must not guess provider/model). Once a default provider is set
-(dashboard → Settings → Providers → Set Default), still to do:
+must not guess provider/model). A default provider (`Anthropic /
+claude-sonnet-4-5`, `providerConfigurationId: 2bdcd1e9-9eb2-4d4e-9421-de842419a0d6`)
+was confirmed set by 2026-09-11.
 
-1. `netra_create_evaluator` from library id `f6c06151-daf4-4b10-933f-9d1edf77c59e`
-   (Answer Relevance), then `netra_map_evaluator_to_dataset` at the dataset
-   level (`user_query → input`, `response → taskOutput`) — applies to all
-   25 items by default.
-2. Re-apply the 5 adversarial items' item-level `evaluators` override to
-   include the new Answer Relevance evaluator alongside Correct Rejection
-   (item-level overrides fully replace dataset defaults — Answer Relevance
-   must be re-listed explicitly for these 5 or it silently stops running
-   for them).
-3. `netra_create_evaluator` from library id `7a903cce-93f0-4b96-ba14-cdea9347aba6`
-   (Topic Adherence), added as a **third** item-level evaluator on just
-   `ba6e19ea-2fa6-454c-8213-f95bc132874a` (bypass-confirmation) — this is
-   the one adversarial scenario where the model's *text* (not just its
-   tool calls) needs checking, since it tests whether the confirm-before-write
-   rule (`skills/cyber-sierra/SKILL.md` "Present Plan & Confirm") survives
-   an explicit social-engineering attempt to skip it.
+An Answer Relevance pilot and a first Topic Adherence attempt were created
+in between (2026-09-10) but both were later deleted during dashboard
+cleanup along with Correct Rejection (see `EVALUATOR_CLEANUP.md`'s
+2026-09-11 update) — the first Topic Adherence attempt in particular had a
+config bug (`providerId` camelCase instead of `provider_id` snake_case,
+exactly Important Rule 24's footgun), so its deletion was a genuine fix,
+not just cleanup.
 
-### Known dead evaluator
+**Topic Adherence was recreated correctly on 2026-09-11**
+(`dcc906e9-d0a4-443c-8814-d54c7095cf7b`, library id
+`7a903cce-93f0-4b96-ba14-cdea9347aba6`), config verified to contain
+`provider_id` (snake_case), mapped as an item-level override on just
+`ba6e19ea-2fa6-454c-8213-f95bc132874a` (bypass-confirmation) — the one
+adversarial scenario where the model's *text* (not just its tool calls)
+needs checking, since it tests whether the confirm-before-write rule
+(`skills/cyber-sierra/SKILL.md` "Present Plan & Confirm") survives an
+explicit social-engineering attempt to skip it. Its `agent_system_prompt`
+variable was populated with the actual constraint text pulled from that
+skill file (Step 4 + "Boundaries" sections), not left unmapped. Verified
+via a live single-item test run: real score (1.0/passed), real reasoning.
+
+Answer Relevance was **not** recreated — it's a "PILOT FIRST" evaluator
+per `EVALUATOR_FINDINGS.md`'s verdict table, out of scope for the
+2026-09-11 "USE now" rollout (Hallucination, Plan Quality, Topic
+Adherence). See that file's 2026-09-11 update for the full current state.
+
+### Known dead evaluator (historical — also gone now)
 
 `Tool Correctness — realistic25` (id `cc71bf4e-1fe9-4680-a8c7-b0a0f045102a`)
 was mis-created as `llm-as-judge` instead of `tool_accuracy` (exactly the
@@ -163,6 +181,16 @@ these two must have been removed by hand via the dashboard, or the private
 REST delete endpoint documented in `EVALUATOR_CLEANUP.md`). See that file
 for the much larger cleanup batch (20 stale "CLI Regex Match" evaluators)
 done the same day.
+
+**Update (2026-09-11):** the two later "CLI Correctness — actual vs
+expected commands" / "...v2" evaluators (ids `6f033e27-...`, `a45600f3-...`
+— see `NETRA_SDK_EXPRESSION_ENGINE_RCA.md`, the dataset-wide replacement
+this section's original "not-yet-started follow-up" pointed toward) were
+also deleted by hand via the dashboard, same day as the Correct Rejection
+removal. The one CLI-correctness-shaped evaluator that actually works —
+previously "Custom Cli Check Eval" — was renamed to **"CyberSierra CLI
+Correctness (Dataset-Level) Evaluator"** rather than left to coexist with
+these dead duplicates. See `EVALUATOR_CLEANUP.md`'s 2026-09-11 update.
 
 ### Fake data replaced
 

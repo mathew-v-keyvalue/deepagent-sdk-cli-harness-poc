@@ -125,6 +125,25 @@ def _extract_plan_commands(plan_json: str | None) -> list[str]:
     return [step["command"] for step in plan.get("steps", []) if step.get("command")]
 
 
+def _extract_plan_outputs(tool_output: str | None) -> list[str]:
+    """Best-effort extraction of every step's real `stdout` from a
+    `run_execution_plan` call's JSON-encoded return value (see
+    `harness/executor_tool.py`'s `{"result": ..., "executionLog": [...]}`
+    shape — each entry already carries the real per-step `stdout`). Feeds
+    the Netra eval track's Hallucination evaluator, which needs the actual
+    CLI output the final answer must stay grounded in — mirrors
+    `_extract_plan_commands`'s error handling: a malformed/missing payload
+    contributes no outputs rather than raising.
+    """
+    if not tool_output:
+        return []
+    try:
+        payload = json.loads(tool_output)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [entry["stdout"] for entry in payload.get("executionLog", []) if entry.get("stdout")]
+
+
 # One checkpointer for the life of this process, shared by every session —
 # this IS the state; server/sessions.py (like the Claude POC's) holds only
 # a session-id -> lock/metadata mapping, never message history. Process-
@@ -395,6 +414,7 @@ async def run(prompt: str, access_token: str = "") -> str:
     final_text = ""
     llm_tracker = _LlmCallTracker()
     actual_commands_seen: list[str] = []
+    actual_outputs_seen: list[str] = []
     with Netra.start_span("Agent_Turn", as_type=SpanType.TOOL, module_name="agent") as span:
         span.set_attribute("agent.thread_id", thread_id)
         Netra.set_session_id(thread_id)
@@ -425,6 +445,26 @@ async def run(prompt: str, access_token: str = "") -> str:
                             match = _CYBERSIERRA_COMMAND_PATTERN.search(shell_command)
                             if match:
                                 actual_commands_seen.append(" ".join(match.groups()))
+                elif event["event"] == "on_tool_end" and event["name"] in ("run_execution_plan", "execute"):
+                    # The counterpart to the on_tool_start branch above: reads
+                    # the tool's actual return value (real output), not its
+                    # planned input, into agent.actual_outputs below — the
+                    # grounding context the Netra eval track's Hallucination
+                    # evaluator checks the final answer against. In practice
+                    # the model calls `execute` directly (confirmed live via a
+                    # debug trace — not `run_execution_plan`, despite an
+                    # earlier comment assuming otherwise); `execute`'s
+                    # ToolMessage.content is already the raw CLI output text,
+                    # no JSON envelope to parse. `run_execution_plan` (if ever
+                    # actually used) returns the JSON-encoded executionLog
+                    # shape `_extract_plan_outputs` parses instead.
+                    tool_output = event["data"].get("output")
+                    output_text = getattr(tool_output, "content", tool_output)
+                    if isinstance(output_text, str):
+                        if event["name"] == "run_execution_plan":
+                            actual_outputs_seen += _extract_plan_outputs(output_text)
+                        else:
+                            actual_outputs_seen.append(output_text)
 
             # Only meaningful AFTER the graph has actually run at least once on
             # this thread: SkillsMiddleware populates `skills_metadata` via its
@@ -447,6 +487,11 @@ async def run(prompt: str, access_token: str = "") -> str:
             # track's Tool Correctness evaluator reads via
             # spans[?name=='Agent_Turn'] | [0].agent.actual_commands.
             span.set_attribute("agent.actual_commands", actual_commands_seen)
+            # Same raw list[str] convention as agent.actual_commands, but real
+            # executed stdout instead of planned commands — the Netra eval
+            # track's Hallucination evaluator reads this as retrieved_context via
+            # spans[?name=='Agent_Turn'] | [0].agent.actual_outputs.
+            span.set_attribute("agent.actual_outputs", actual_outputs_seen)
             span.set_attribute("agent.status", "success")
             span.set_success()
         except Exception as exc:  # noqa: BLE001 — re-raised unchanged, span is observability only
@@ -555,6 +600,7 @@ async def stream(
     usage_totals: dict[str, int] = {}
     tool_calls_seen: list[str] = []
     actual_commands_seen: list[str] = []
+    actual_outputs_seen: list[str] = []
     llm_tracker = _LlmCallTracker()
     final_text = ""
 
@@ -590,6 +636,24 @@ async def stream(
                                 if match:
                                     actual_commands_seen.append(" ".join(match.groups()))
                         yield ToolUseStarted(event["name"], event["data"].get("input"))
+                    elif kind == "on_tool_end" and event["name"] in ("run_execution_plan", "execute"):
+                        # Counterpart to the on_tool_start branch above: reads
+                        # the tool's actual return value (real output), not
+                        # its planned input — feeds agent.actual_outputs
+                        # below, the grounding context the Netra eval track's
+                        # Hallucination evaluator checks the final answer
+                        # against. In practice the model calls `execute`
+                        # directly (confirmed live — not `run_execution_plan`,
+                        # despite an earlier comment assuming otherwise);
+                        # `execute`'s ToolMessage.content is already the raw
+                        # CLI output text, no JSON envelope to parse.
+                        tool_output = event["data"].get("output")
+                        output_text = getattr(tool_output, "content", tool_output)
+                        if isinstance(output_text, str):
+                            if event["name"] == "run_execution_plan":
+                                actual_outputs_seen += _extract_plan_outputs(output_text)
+                            else:
+                                actual_outputs_seen.append(output_text)
                     elif kind == "on_chat_model_end":
                         num_turns += 1
                         message = event["data"]["output"]
@@ -632,6 +696,11 @@ async def stream(
                 # signal for the Netra eval track, mirroring
                 # eval/local/scoring.py's extract_actual_commands().
                 span.set_attribute("agent.actual_commands", actual_commands_seen)
+                # Same raw list[str] convention, but real executed stdout
+                # instead of planned commands — the Hallucination evaluator's
+                # retrieved_context, mapped via spans[?name=='Agent_Turn'] |
+                # [0].agent.actual_outputs.
+                span.set_attribute("agent.actual_outputs", actual_outputs_seen)
                 if trace_content_enabled():
                     Netra.set_root_output(scrub(final_text, access_token))
                 span.set_attribute("agent.status", "success")

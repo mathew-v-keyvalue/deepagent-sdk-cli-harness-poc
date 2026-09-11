@@ -65,19 +65,23 @@ dead expression):
 
 - [x] CLI Regex Match — notifications feed unread-count — `cadd650d-f2ad-4c1b-a52a-dc59ee57c1d4`
 
-## Kept — do not delete
+## Kept — do not delete (superseded, see 2026-09-11 update below)
 
-- `Correct Rejection (No Tools Called)` — `9c0649bf-2a7f-4e20-b6cf-8af166d80ac0`
-  — uses the working `agent.actual_commands` expression. As of this cleanup
-  it's the **only** evaluator in the project.
+- ~~`Correct Rejection (No Tools Called)` — `9c0649bf-2a7f-4e20-b6cf-8af166d80ac0`~~
+  — **deleted 2026-09-11, not required.** Was the only evaluator in the
+  project as of this cleanup; see the update below for why it was removed
+  and what replaced it.
 
-**Caution**: `EVALUATOR_SETUP.md` records this evaluator as applied via
-item-level override on 5 adversarial dataset items in
-`cybersierra-morpheus-realistic-25` (`73cb309e-78ac-416d-b9ce-68fe6ad64a3f`),
-but the live `netra_get_dataset_items` response for that dataset doesn't
-surface any evaluator-override info at all — worth confirming in the
-dashboard that those 5 overrides are still actually in place before
-assuming this evaluator is doing anything today.
+**Caution** (historical, resolved 2026-09-11): `EVALUATOR_SETUP.md` recorded
+this evaluator as applied via item-level override on 5 adversarial dataset
+items in `cybersierra-morpheus-realistic-25`
+(`73cb309e-78ac-416d-b9ce-68fe6ad64a3f`), but the live `netra_get_dataset_items`
+response for that dataset doesn't surface any evaluator-override info at
+all. This was confirmed still true on 2026-09-11 (re-checked empirically,
+both before and after deleting the evaluator) — deleting an evaluator
+record does **not** clear item-level override pointers to it; those 5
+items' overrides were separately cleared via
+`netra_update_dataset_item(evaluators=[])`.
 
 ## Result
 
@@ -88,3 +92,26 @@ CLI-correctness replacement (one custom evaluator matching
 `agent.actual_commands` against each item's own `expectedOutput`, mapped
 dataset-wide — see `EVALUATOR_FINDINGS.md`'s conclusion) is separate,
 not-yet-started follow-up work.
+
+## Update (2026-09-11)
+
+Further cleanup, done by hand in the Netra dashboard's "My Evaluators" section:
+
+- `Correct Rejection (No Tools Called)` (`9c0649bf-...`) — **deleted**, not required.
+  Its 5 item-level overrides were cleared separately (see caution above).
+- Both dead "CLI Correctness — actual vs expected commands" / "...v2" evaluators
+  (ids `6f033e27-...`, `a45600f3-...`, see `EVALUATOR_SETUP.md`'s "Known dead
+  evaluator" section and `NETRA_SDK_EXPRESSION_ENGINE_RCA.md`) — **deleted**.
+- "Custom Cli Check Eval" (`706877e7-aa47-431c-ab1a-c22af5fbcb57`, `code` type,
+  active on the `-noconfirm` dataset) — **renamed**, not deleted, to
+  **"CyberSierra CLI Correctness (Dataset-Level) Evaluator"** — this is the one
+  CLI-correctness-shaped evaluator that was actually working; renaming it
+  instead of leaving 3 overlapping "CLI Correctness"-named evaluators around
+  removes the naming confusion at its root.
+
+Net effect: the project went from 1 evaluator (this file's original "Result"
+above) to a brief peak of 6 (after adding pilot/session evaluators in a
+separate track), back down to 1 clean evaluator post-cleanup, before
+`EVALUATOR_FINDINGS.md`'s 2026-09-11 update added 3 more (Topic Adherence,
+Plan Quality, Hallucination) for the "USE now" evaluator rollout — see that
+file for the full account of what's live today.
