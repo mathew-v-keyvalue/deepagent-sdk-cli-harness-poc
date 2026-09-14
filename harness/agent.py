@@ -40,7 +40,13 @@ from langgraph.types import Command
 
 from harness.executor_tool import make_run_execution_plan_tool
 from harness.model import resolve_model
-from harness.sandbox import AllowlistedShellBackend, ShellSandboxMiddleware, _plan_has_unsafe_step, scrub
+from harness.sandbox import (
+    AllowlistedShellBackend,
+    ShellSandboxMiddleware,
+    _is_execute_command_unsafe,
+    _plan_has_unsafe_step,
+    scrub,
+)
 from harness.tracing import Netra, SpanType, trace_content_enabled
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -237,12 +243,21 @@ _SKILL_WRITE_INTERRUPT = InterruptOnConfig(allowed_decisions=["approve", "reject
 
 
 def _build_interrupt_on(mode: str, write_unlocked: bool) -> dict[str, InterruptOnConfig] | None:
-    """The two independent `interrupt_on` gates this harness's modes need:
+    """The three independent `interrupt_on` gates this harness's modes need:
 
     - `run_execution_plan`, only in `agent_auto` — the one-time-unlock gate.
       Pauses only while `write_unlocked` is False AND the submitted plan
       actually contains a write step; a read-only plan never pauses, and
       once unlocked this session's future plans never pause again either.
+    - `execute`, only in `agent_auto` — same one-time-unlock gate, same
+      `write_unlocked` flag, but classifying an ad-hoc shell command's
+      safety needs `_is_execute_command_unsafe` instead of
+      `_plan_has_unsafe_step` (a raw command string has no `safe` field of
+      its own the way a plan step does — see that function's docstring for
+      how it's actually classified). **Not a hypothetical gap**: confirmed
+      live against a real server/tenant that the model routinely writes via
+      this path instead of `run_execution_plan` — two real records got
+      created with zero approval before this existed.
     - Skill-writes (`write_file`/`edit_file`/`delete` targeting
       `skills/_generated/`), in both `agent_plan` and `agent_auto` — always
       pauses, regardless of `write_unlocked`. In `agent_plan`, this is the
@@ -266,10 +281,18 @@ def _build_interrupt_on(mode: str, write_unlocked: bool) -> dict[str, InterruptO
             tool_call = request.tool_call
             return _plan_has_unsafe_step(tool_call.get("args") or {})
 
+        def _execute_predicate(request: Any) -> bool:
+            if write_unlocked:
+                return False
+            tool_call = request.tool_call
+            command = str((tool_call.get("args") or {}).get("command", ""))
+            return _is_execute_command_unsafe(command)
+
         return {
             "run_execution_plan": InterruptOnConfig(
                 allowed_decisions=["approve", "reject"], when=_run_execution_plan_predicate
             ),
+            "execute": InterruptOnConfig(allowed_decisions=["approve", "reject"], when=_execute_predicate),
             "write_file": _SKILL_WRITE_INTERRUPT,
             "edit_file": _SKILL_WRITE_INTERRUPT,
             "delete": _SKILL_WRITE_INTERRUPT,
@@ -749,14 +772,20 @@ async def stream(
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": GRAPH_RECURSION_LIMIT}
 
     logger.info(
-        "turn_start thread_id=%s is_new=%s prompt=%r",
+        "turn_start thread_id=%s is_new=%s mode=%s write_unlocked=%s is_resume_decision=%s prompt=%r",
         thread_id,
         session_id is not None,
+        mode,
+        write_unlocked,
+        decision is not None,
         scrub(prompt, access_token)[:200],
         extra={
             "event": "turn_start",
             "thread_id": thread_id,
             "is_new_session": session_id is not None,
+            "mode": mode,
+            "write_unlocked": write_unlocked,
+            "is_resume_decision": decision is not None,
             "prompt_preview": scrub(prompt, access_token)[:200],
         },
     )
@@ -883,9 +912,10 @@ async def stream(
                 if pending_interrupts:
                     hitl_request = pending_interrupts[0].value
                     logger.info(
-                        "approval_paused thread_id=%s",
+                        "approval_paused thread_id=%s mode=%s",
                         thread_id,
-                        extra={"event": "approval_paused", "thread_id": thread_id},
+                        mode,
+                        extra={"event": "approval_paused", "thread_id": thread_id, "mode": mode},
                     )
                     span.set_attribute("agent.status", "awaiting_approval")
                     span.set_success()
@@ -898,8 +928,9 @@ async def stream(
                 await _log_skills_available(graph, config, access_token)
 
                 logger.info(
-                    "turn_done thread_id=%s num_turns=%d tool_calls=%r usage=%r actual_commands=%r",
+                    "turn_done thread_id=%s mode=%s num_turns=%d tool_calls=%r usage=%r actual_commands=%r",
                     thread_id,
+                    mode,
                     num_turns,
                     tool_calls_seen,
                     usage_totals,
@@ -907,6 +938,7 @@ async def stream(
                     extra={
                         "event": "turn_done",
                         "thread_id": thread_id,
+                        "mode": mode,
                         "num_turns": num_turns,
                         "tool_calls": tool_calls_seen,
                         "usage": usage_totals,
@@ -949,7 +981,9 @@ async def stream(
                 span.set_error(str(exc))
                 raise
     except Exception as exc:  # noqa: BLE001 — deliberately broad, see Claude POC's ClaudeSDKError handling
-        logger.exception("harness_error thread_id=%s", thread_id, extra={"event": "harness_error", "thread_id": thread_id})
+        logger.exception(
+            "harness_error thread_id=%s mode=%s", thread_id, mode, extra={"event": "harness_error", "thread_id": thread_id, "mode": mode}
+        )
         yield Failed("harness_error", str(exc))
 
 

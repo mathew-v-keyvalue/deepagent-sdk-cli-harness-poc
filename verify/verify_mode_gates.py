@@ -49,6 +49,14 @@ Checks, in order:
    unsafe-plan attempt still pauses (unlock was never granted).
 6. Skill-write always-asks, independent of `write_unlocked`: even in an
    already-unlocked `agent_auto` session, a skill-write still pauses.
+7. Ad-hoc `execute` gating -- added after this was confirmed LIVE (2026-09-14,
+   real server, real tenant) to be a real bypass, not a hypothetical one: the
+   model routinely writes via `execute` instead of `run_execution_plan`, and
+   before this check existed nothing gated it. Confirms an ad-hoc write-shaped
+   command (matched against the real manifest's own safe mapping) pauses in
+   agent_auto, a read-shaped one doesn't, and the gate shares agent_auto's
+   one-time write_unlocked flag with run_execution_plan (approving one
+   unlocks the other too).
 """
 
 from __future__ import annotations
@@ -350,6 +358,80 @@ async def check_skill_write_always_asks_even_when_unlocked() -> bool:
     return True
 
 
+async def check_execute_command_gating() -> bool:
+    """Regression test for the live-confirmed gap: the model routinely
+    writes via ad-hoc `execute` instead of `run_execution_plan`, and before
+    `_is_execute_command_unsafe`/the `execute` interrupt_on entry existed,
+    nothing gated it -- two real records got created in a live tenant with
+    zero approval. `tprm assessees create`/`tprm assessees list` are real
+    manifest operations (write/read respectively), not stand-ins.
+    """
+    from harness import agent as agent_module
+
+    ok = True
+
+    # A real write-shaped ad-hoc command must pause.
+    events, _ = await _stream_all(
+        "agent_auto",
+        [_tool_call("execute", {"command": "cybersierra tprm assessees create --data '{\"companyName\":\"verify-test\"}'"})],
+        prompt="create a vendor",
+        session_id="execgate-write",
+    )
+    if not any(isinstance(e, agent_module.AwaitingApproval) for e in events):
+        print("FAIL (execute-gating): a real write-shaped ad-hoc execute command did not pause in agent_auto")
+        ok = False
+    else:
+        print("PASS (execute-gating): a write-shaped ad-hoc execute command pauses in agent_auto")
+
+    # A real read-shaped ad-hoc command must NOT pause.
+    events, _ = await _stream_all(
+        "agent_auto",
+        [_tool_call("execute", {"command": "cybersierra tprm assessees list --data '{\"limit\":1}'"})],
+        prompt="list vendors",
+        session_id="execgate-read",
+    )
+    if any(isinstance(e, agent_module.AwaitingApproval) for e in events):
+        print("FAIL (execute-gating): a real read-shaped ad-hoc execute command paused unnecessarily")
+        ok = False
+    else:
+        print("PASS (execute-gating): a read-shaped ad-hoc execute command does not pause")
+
+    # Approving the execute-gate's pause must share write_unlocked with
+    # run_execution_plan's gate -- a subsequent unsafe run_execution_plan
+    # call in the SAME session must not pause again either.
+    session_id = "execgate-shared-unlock"
+    events1, _ = await _stream_all(
+        "agent_auto",
+        [_tool_call("execute", {"command": "cybersierra tprm assessees create --data '{\"companyName\":\"verify-test\"}'"})],
+        prompt="create a vendor",
+        session_id=session_id,
+    )
+    if not any(isinstance(e, agent_module.AwaitingApproval) for e in events1):
+        print("FAIL (execute-gating): setup for shared-unlock check didn't pause as expected")
+        return False
+    events2, _ = await _stream_all(
+        "agent_auto", [], resume=session_id, write_unlocked=False, decision={"type": "approve"}
+    )
+    if not any(isinstance(e, agent_module.Done) for e in events2):
+        print(f"FAIL (execute-gating): approving the execute-gate pause did not lead to completion: {events2!r}")
+        ok = False
+    else:
+        events3, _ = await _stream_all(
+            "agent_auto",
+            [_run_execution_plan_call(safe=False, call_id="c3")],
+            prompt="do another write",
+            session_id="execgate-shared-unlock-turn2",  # fresh thread_id, same write_unlocked=True flag
+            write_unlocked=True,
+        )
+        if any(isinstance(e, agent_module.AwaitingApproval) for e in events3):
+            print("FAIL (execute-gating): run_execution_plan paused again despite the execute-gate's approval having set write_unlocked")
+            ok = False
+        else:
+            print("PASS (execute-gating): approving the execute-gate's pause unlocks run_execution_plan's gate too (shared write_unlocked)")
+
+    return ok
+
+
 def main() -> int:
     checks = [
         check_prerequisite_fix_regression,
@@ -358,6 +440,7 @@ def main() -> int:
         check_approve_then_unlock,
         check_reject_then_repause,
         check_skill_write_always_asks_even_when_unlocked,
+        check_execute_command_gating,
     ]
     results = [asyncio.run(check()) for check in checks]
     if all(results):

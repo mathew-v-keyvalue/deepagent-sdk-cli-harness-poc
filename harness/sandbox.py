@@ -56,6 +56,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import subprocess
 import time
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -222,6 +224,79 @@ def _plan_has_unsafe_step(args: dict[str, Any]) -> bool:
         return True
     steps = plan.get("steps", []) if isinstance(plan, dict) else []
     return any(isinstance(step, dict) and step.get("safe") is False for step in steps)
+
+
+# Confirmed live (2026-09-14, real server, real tenant): the model routinely
+# writes via this ad-hoc `execute` path instead of `run_execution_plan` --
+# two real records got created in a live tenant with zero approval before
+# this existed, because `interrupt_on` only ever covered `run_execution_plan`.
+# `execute` has no `safe` field of its own the way a plan step does, so
+# classifying it means matching the raw command against the real manifest's
+# own `module resource action` -> `safe` mapping instead.
+_MANIFEST_OPERATION = re.compile(r"^(?:npx\s+)?cybersierra\s+([a-z][\w-]*)\s+([a-z][\w-]*)\s+([a-z][\w-]*)\b")
+
+_manifest_tree_cache: dict[str, list[dict[str, Any]]] | None = None
+
+
+def _get_manifest_tree() -> dict[str, list[dict[str, Any]]]:
+    """Process-lifetime cache of `cybersierra manifest --raw`'s module tree --
+    tied to CLI version, not to any user/session, so caching it for the life
+    of the process is safe (same "no expiry" reasoning already settled for
+    sessions elsewhere in this design). Deliberately synchronous/blocking:
+    `interrupt_on`'s `when` predicate (harness/agent.py) is itself sync, and
+    this only ever actually shells out once per process -- every call after
+    the first hits the cache.
+    """
+    global _manifest_tree_cache
+    if _manifest_tree_cache is None:
+        try:
+            result = subprocess.run(
+                ["cybersierra", "manifest", "--raw"], capture_output=True, text=True, timeout=30, check=False
+            )
+            _manifest_tree_cache = json.loads(result.stdout)["tree"] if result.returncode == 0 else {}
+        except Exception:
+            logger.exception(
+                "manifest_fetch_failed -- ad-hoc execute commands will fail safe (treated as unsafe) until this succeeds"
+            )
+            _manifest_tree_cache = {}
+    return _manifest_tree_cache
+
+
+def _is_execute_command_unsafe(command: str) -> bool:
+    """True if an ad-hoc `execute` call's raw command string is write-shaped
+    -- the `execute`-side counterpart to `_plan_has_unsafe_step` (which does
+    the same job for a structured plan step's own `safe` field). Classifies
+    by matching the command against the real manifest's `module resource
+    action` -> `safe` mapping (fetched once, cached -- see
+    `_get_manifest_tree`).
+
+    Fails safe (returns `True`, "needs approval") whenever classification
+    can't be made confidently: the manifest lookup itself failed, the
+    operation isn't found in it, or the manifest doesn't mark it `"safe":
+    true` explicitly -- mirrors `_plan_has_unsafe_step`'s own "anything not
+    explicitly safe" rule. Returns `False` for anything that isn't a
+    `cybersierra <module> <resource> <action>`-shaped command at all (e.g.
+    `cybersierra --version`, `cybersierra manifest --raw`, `npm list -g
+    ...`) -- these are CLI/environment housekeeping, not tenant-data
+    operations, so there's nothing here to gate. Also `False` for a
+    `--help` lookup on an otherwise write-shaped operation (e.g.
+    `cybersierra tprm assessees create --help`) -- confirmed live this
+    otherwise pauses on a request for documentation text, never touching
+    tenant data at all; asking a human to approve reading help output is
+    pure friction with no safety benefit.
+    """
+    command = command.strip()
+    if re.search(r"(?:^|\s)--help\b", command) or command.endswith(" help"):
+        return False
+    match = _MANIFEST_OPERATION.match(command)
+    if not match:
+        return False
+    module, resource, action = match.groups()
+    tree = _get_manifest_tree()
+    for op in tree.get(module, []):
+        if op.get("resource") == resource and op.get("action") == action:
+            return op.get("safe") is not True
+    return True
 
 
 class AllowlistedShellBackend(LocalShellBackend):

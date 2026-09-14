@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -104,6 +105,17 @@ app.add_middleware(
 )
 
 _FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+
+# Nests under "harness" (not "server") specifically so harness/observability.py's
+# configure_logging() -- which only attaches a handler to the "harness" logger
+# and sets propagate=False -- actually picks this up into logs/harness.log
+# alongside every other cli_call_*/tool_call_*/turn_* line, instead of going
+# nowhere. Covers the two mode-related events harness/agent.py doesn't own:
+# mode_switched (a session's mode changes) and approval_decided (/decide is
+# called) -- approval_paused itself is logged in harness/agent.py, where the
+# pause is actually detected.
+logger = logging.getLogger("harness.server")
+logger.addHandler(logging.NullHandler())
 
 
 def _sse(event: str, data: dict) -> str:
@@ -264,6 +276,13 @@ async def chat(
             # different `mode` value," no separate mode-switch endpoint (see
             # poc-wiki/execution-modes/architecture-changes.md). set_mode()
             # also resets write_unlocked if the new mode is agent_auto.
+            logger.info(
+                "mode_switched session_id=%s from=%s to=%s",
+                session_id,
+                entry.mode,
+                mode,
+                extra={"event": "mode_switched", "session_id": session_id, "from_mode": entry.mode, "to_mode": mode},
+            )
             store.set_mode(session_id, mode)
 
     async def event_source() -> AsyncIterator[str]:
@@ -337,6 +356,13 @@ async def decide(
             content={"error": {"code": "session_busy", "message": "a turn is already in flight for this session"}},
         )
 
+    logger.info(
+        "approval_decided session_id=%s mode=%s decision=%s",
+        session_id,
+        entry.mode,
+        decision,
+        extra={"event": "approval_decided", "session_id": session_id, "mode": entry.mode, "decision": decision},
+    )
     if decision == "approve":
         entry.write_unlocked = True
     decision_payload = {"type": decision} if decision == "approve" else {"type": decision, "message": message}
