@@ -57,6 +57,7 @@ from fastapi.staticfiles import StaticFiles
 
 from harness.agent import Done, Failed, TextDelta, ToolUseStarted, stream
 from harness.observability import configure_logging
+from harness.startup_checks import assert_mode_dependencies_compatible
 from harness.tracing import init_tracing
 from server.sessions import store
 
@@ -67,6 +68,11 @@ configure_logging()  # see harness/observability.py — this is what makes
 # that configures its own logging.
 init_tracing()  # see harness/tracing.py — no-op unless NETRA_TRACING and
 # NETRA_API_KEY are both set; enables the cli_call/Plan_Step/Agent_Turn spans.
+assert_mode_dependencies_compatible()  # see harness/startup_checks.py —
+# fails at process start, before this server accepts a single request, if
+# the installed deepagents/langchain/langgraph don't match what the
+# execution-modes design (interrupt_on, TodoListMiddleware) was verified
+# against.
 
 app = FastAPI(title="cybersierra chat server (DeepAgents POC)")
 
