@@ -1,10 +1,15 @@
 # Execution Modes: Ask / Agent(Plan, Auto) (proposal)
 
-Status: **proposal — approved design, implementation not started.** This
-work is scoped to a separate branch, picked up later — nothing in
-`v2/eval-harness` should change for this yet. This folder plus
-`~/.claude/plans/abstract-growing-lemur.md` (the implementation plan) are
-the handoff record for whoever starts that branch.
+Status: **implemented on `v3/agent-modes-implementation`** (7 commits:
+cleanup, the `run_execution_plan` sandbox fix, the startup dependency
+check, mode/write_unlocked plumbing, hard-deny gating, `interrupt_on` +
+new SSE events + the `/decide` endpoint, and `TodoListMiddleware`).
+`verify/verify_mode_gates.py` (17 checks) and the pre-existing
+`verify/verify_shell_sandbox_denies.py` both pass. Not yet pushed to any
+remote, no PR opened. Still outstanding: cross-repo coordination
+(`morpheus_fe`/`morpheus_backend` — the mode switcher and approval UI live
+there, not here), and the two open decisions in `open-questions.md`
+(failure-state client messaging, shell-grammar hardening timing).
 
 This folder documents turning the harness's current single mode into a
 two-level set of modes, requested by product: something like Cursor's

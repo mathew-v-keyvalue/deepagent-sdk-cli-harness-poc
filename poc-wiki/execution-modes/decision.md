@@ -1,9 +1,13 @@
 # Execution Modes — Proposal & Decisions
 
-**Status:** Design approved, ready for implementation on a new branch off
-`v2/eval-harness`. This document is the final, standalone record — see
-`decisions-log.md` for the fuller reasoning/examples behind each item and
-`architecture-changes.md` for file-by-file implementation detail.
+**Status:** Implemented, on `v3/agent-modes-implementation` (branched off
+`feat/agent-modes-explorations`, itself off `v2/eval-harness`) — 7 commits,
+`verify/verify_mode_gates.py` (17 checks) and the pre-existing sandbox
+verify script both passing. Not pushed to any remote yet, no PR opened.
+This document is the final, standalone record — see `decisions-log.md`
+for the fuller reasoning/examples behind each item and
+`architecture-changes.md` for file-by-file implementation detail (now
+"as-built" rather than purely prospective).
 
 ## 1. Problem
 
