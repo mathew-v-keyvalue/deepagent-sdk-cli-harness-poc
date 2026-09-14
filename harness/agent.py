@@ -244,20 +244,20 @@ def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None =
     JWTs.
 
     Correction, not the original design either: earlier versions of this
-    harness (and this repo's README/ARCHITECTURE.md, not yet corrected as of
-    this comment) injected `CYBERSIERRA_TOKEN`, believing that was the CLI's
-    override variable. It isn't — grepping the actual installed
-    `~/.cybersierra/bin/cybersierra` binary shows zero references to
-    `CYBERSIERRA_TOKEN` anywhere in it; the real variable, confirmed both by
-    reading the binary's profile-resolution code and by reproducing live
-    (`MORPHEUS_TOKEN=<garbage> cybersierra auth whoami` gets a real "Invalid
-    token" rejection from the backend; `CYBERSIERRA_TOKEN=<garbage>` against
-    the same command is silently ignored, identical to setting nothing), is
-    `MORPHEUS_TOKEN`. This means `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` was a
-    silent no-op in every prior version of this code — every request kept
-    using the persisted profile regardless of which per-request token was
-    sent. README "Authentication model" needs a correction pass; this
-    docstring and the actual injection below are already fixed.
+    harness (and this repo's README/ARCHITECTURE.md) injected
+    `CYBERSIERRA_TOKEN`, believing that was the CLI's override variable. It
+    isn't — grepping the actual installed `~/.cybersierra/bin/cybersierra`
+    binary shows zero references to `CYBERSIERRA_TOKEN` anywhere in it; the
+    real variable, confirmed both by reading the binary's profile-resolution
+    code and by reproducing live (`MORPHEUS_TOKEN=<garbage> cybersierra auth
+    whoami` gets a real "Invalid token" rejection from the backend;
+    `CYBERSIERRA_TOKEN=<garbage>` against the same command is silently
+    ignored, identical to setting nothing), is `MORPHEUS_TOKEN`. This means
+    `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` was a silent no-op in every prior
+    version of this code — every request kept using the persisted profile
+    regardless of which per-request token was sent. This docstring, the
+    actual injection below, and README "Authentication model" are all fixed
+    (see that section's own "Correction (post-v2-wiring review)" paragraph).
 
     `access_token` itself is optional now, not required (see
     `server/app.py` and README "Authentication model" — the `no_token` 400
@@ -314,10 +314,10 @@ def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None =
         # and would work with a real token); CYBERSIERRA_TOKEN=<garbage>
         # against the same command is silently ignored and resolves to the
         # persisted profile instead -- identical output to setting nothing
-        # at all. This repo's docs previously claimed the opposite (see
-        # README "Authentication model" -- that section is now stale and
-        # needs correcting); this was never actually true against a real
-        # CLI install.
+        # at all. This repo's docs previously claimed the opposite; this was
+        # never actually true against a real CLI install -- see README
+        # "Authentication model"'s own "Correction (post-v2-wiring review)"
+        # paragraph, already fixed.
         env["MORPHEUS_TOKEN"] = access_token
 
     backend = AllowlistedShellBackend(
