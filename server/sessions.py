@@ -41,19 +41,32 @@ class SessionEntry:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     created_at: float = field(default_factory=time.monotonic)
     last_active_at: float = field(default_factory=time.monotonic)
+    # Execution mode for this session -- "ask" / "agent_plan" / "agent_auto"
+    # (see poc-wiki/execution-modes/mode-design.md). Session-scoped, not
+    # per-message: set once (at creation, or via set_mode() below), read on
+    # every /chat call for this session.
+    mode: str = "agent_auto"
+    # One-time write-approval gate for agent_auto mode. Starts False; the
+    # first write-shaped run_execution_plan call in a session pauses for
+    # approval while this is False, then server/app.py's /decide endpoint
+    # sets it True on approve, before resuming -- subsequent write attempts
+    # in the same session no longer pause. Reset to False whenever the
+    # session (re-)enters agent_auto via set_mode() -- a fresh entry into
+    # Auto always re-gates once, per poc-wiki/execution-modes/decisions-log.md.
+    write_unlocked: bool = False
 
 
 class SessionStore:
     def __init__(self) -> None:
         self._sessions: dict[str, SessionEntry] = {}
 
-    def create(self, session_id: str | None = None) -> str:
+    def create(self, session_id: str | None = None, *, mode: str = "agent_auto") -> str:
         """Start tracking a session, minting a new id unless the caller
         supplies one — needed so a client-chosen id (e.g. one the frontend
         minted before the first request) can be used from turn one instead
         of only ids this store generates itself."""
         session_id = session_id or str(uuid4())
-        self._sessions[session_id] = SessionEntry()
+        self._sessions[session_id] = SessionEntry(mode=mode)
         return session_id
 
     def get(self, session_id: str) -> SessionEntry | None:
@@ -63,6 +76,20 @@ class SessionStore:
         entry = self._sessions.get(session_id)
         if entry is not None:
             entry.last_active_at = time.monotonic()
+
+    def set_mode(self, session_id: str, mode: str) -> None:
+        """Change a session's mode. Resets `write_unlocked` whenever the new
+        mode is `"agent_auto"` -- a fresh entry into Auto always re-gates,
+        even if this session was previously unlocked, switched away, and is
+        now switching back in. Entering `"ask"`/`"agent_plan"` doesn't touch
+        `write_unlocked` -- those modes hard-deny writes regardless of its
+        value, so there's nothing to reset for them."""
+        entry = self._sessions.get(session_id)
+        if entry is None:
+            return
+        entry.mode = mode
+        if mode == "agent_auto":
+            entry.write_unlocked = False
 
     def drop(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)

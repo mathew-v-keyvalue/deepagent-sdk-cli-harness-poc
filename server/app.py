@@ -135,6 +135,12 @@ async def _http_exception_handler(request, exc: HTTPException) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": detail})
 
 
+# Session-scoped, not per-message -- see server/sessions.py's SessionEntry
+# and poc-wiki/execution-modes/mode-design.md. `agent_auto` is the default
+# so an omitted `mode` field matches today's pre-modes behavior exactly.
+_VALID_MODES = {"ask", "agent_plan", "agent_auto"}
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
@@ -150,10 +156,17 @@ async def chat(
     # with; harness.agent treats an empty access_token as "no per-request
     # identity," not as an error.
     access_token: str = Form(""),
+    mode: str = Form("agent_auto"),
 ):
+    if mode not in _VALID_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_mode", "message": f"mode must be one of {sorted(_VALID_MODES)}"},
+        )
+
     is_new_session = session_id is None
     if is_new_session:
-        session_id = store.create()
+        session_id = store.create(mode=mode)
     else:
         entry = store.get(session_id)
         if entry is None:
@@ -163,7 +176,7 @@ async def chat(
             # of only a server-minted one (see server/sessions.py's
             # create()). Everything else about a brand-new session is
             # unchanged from the session_id-omitted path below.
-            store.create(session_id)
+            store.create(session_id, mode=mode)
             is_new_session = True
         # Non-blocking check-then-acquire: safe under asyncio's single-
         # threaded cooperative scheduling because nothing awaits between the
@@ -181,6 +194,13 @@ async def chat(
                     }
                 },
             )
+        elif entry.mode != mode:
+            # A later message on the same session asked for a different
+            # mode -- switching mode is just "send your next message with a
+            # different `mode` value," no separate mode-switch endpoint (see
+            # poc-wiki/execution-modes/architecture-changes.md). set_mode()
+            # also resets write_unlocked if the new mode is agent_auto.
+            store.set_mode(session_id, mode)
 
     async def event_source() -> AsyncIterator[str]:
         entry = store.get(session_id)
@@ -189,9 +209,13 @@ async def chat(
         try:
             if is_new_session:
                 yield _sse("session", {"session_id": session_id})
-                harness_events = stream(message, access_token, session_id=session_id)
+                harness_events = stream(
+                    message, access_token, session_id=session_id, mode=entry.mode, write_unlocked=entry.write_unlocked
+                )
             else:
-                harness_events = stream(message, access_token, resume=session_id)
+                harness_events = stream(
+                    message, access_token, resume=session_id, mode=entry.mode, write_unlocked=entry.write_unlocked
+                )
 
             async for event in harness_events:
                 if isinstance(event, TextDelta):

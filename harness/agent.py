@@ -213,7 +213,13 @@ _INJECT_ENV_VAR = "CYBERSIERRA_INJECT_ACCESS_TOKEN"
 GRAPH_RECURSION_LIMIT = 500
 
 
-def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None = None):
+def _build_agent(
+    access_token: str = "",
+    *,
+    checkpointer: InMemorySaver | None = None,
+    mode: str = "agent_auto",
+    write_unlocked: bool = False,
+):
     """The one place that assembles this harness's DeepAgents graph.
 
     Called fresh on every `run()`/`stream()` call, exactly like the Claude
@@ -223,6 +229,15 @@ def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None =
     each time; the checkpointer is the one piece of state that's
     intentionally shared across calls, since it's what makes session
     continuity possible at all.
+
+    `mode`/`write_unlocked` are accepted and threaded through starting here,
+    but not yet wired into `create_deep_agent(...)` differently below --
+    that's mode-aware gating (`ShellSandboxMiddleware`'s hard-deny branches)
+    and the `interrupt_on` one-time-unlock gate, both added in later changes
+    (see poc-wiki/execution-modes/architecture-changes.md). This function
+    still builds exactly today's single-mode graph regardless of what's
+    passed here; the parameters exist so callers (`stream()`, `server/
+    app.py`) don't need a second signature change once the gating lands.
 
     Whether `access_token` actually becomes this call's cybersierra
     identity is conditional, and that's a deliberate fix, not the original
@@ -572,6 +587,8 @@ async def stream(
     *,
     session_id: str | None = None,
     resume: str | None = None,
+    mode: str = "agent_auto",
+    write_unlocked: bool = False,
 ) -> AsyncIterator[HarnessEvent]:
     """Run one turn, yielding incremental events as they arrive.
 
@@ -590,6 +607,10 @@ async def stream(
     call's identity by default: it only becomes the cybersierra CLI's
     identity when `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` is set (see
     `_build_agent`).
+
+    `mode`/`write_unlocked` come from `server/app.py`'s `SessionEntry` and
+    are threaded straight through to `_build_agent` — see that function's
+    docstring for why they don't change this turn's behavior yet.
     """
     thread_id = session_id or resume
     if not thread_id:
@@ -619,7 +640,7 @@ async def stream(
     final_text = ""
 
     try:
-        graph = _build_agent(access_token)
+        graph = _build_agent(access_token, mode=mode, write_unlocked=write_unlocked)
 
         with Netra.start_span("Agent_Turn", as_type=SpanType.TOOL, module_name="agent") as span:
             span.set_attribute("agent.thread_id", thread_id)
