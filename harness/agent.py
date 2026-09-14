@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from deepagents import create_deep_agent
+from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.human_in_the_loop import InterruptOnConfig
 from langchain_core.messages import AIMessageChunk, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -412,11 +413,21 @@ def _build_agent(
         redact=access_token,  # scrub from cli_call_* log lines only, see harness/sandbox.py
     )
 
+    middleware: list[Any] = [ShellSandboxMiddleware(redact=access_token, mode=mode)]
+    if mode == "agent_plan":
+        # Gives the model a real `write_todos` tool/structured plan artifact
+        # to produce instead of relying on plain-text prose for "present the
+        # plan" -- see poc-wiki/execution-modes/mode-design.md. Independent
+        # of ShellSandboxMiddleware/interrupt_on (confirmed: TodoListMiddleware
+        # never touches interrupts, tool gating, or anything else those two
+        # manage) -- purely additive, only in this one mode.
+        middleware.append(TodoListMiddleware())
+
     return create_deep_agent(
         model=resolve_model(),
         system_prompt=SYSTEM_PROMPT_APPENDIX,
         tools=[make_run_execution_plan_tool(backend)],
-        middleware=[ShellSandboxMiddleware(redact=access_token, mode=mode)],
+        middleware=middleware,
         skills=[str(SKILLS_ROOT)],
         backend=backend,
         checkpointer=checkpointer if checkpointer is not None else _checkpointer,
