@@ -16,19 +16,25 @@ still produced by the model, following the Planner/Skill-Resolver
 instructions in the ported skill files — this tool only executes an
 already-assembled, already-validated `ExecutionPlan`.
 
-The one thing this tool can NOT enforce that the real skill's Orchestration
-Protocol step 4 ("Present Plan & Confirm") asks for: an actual runtime
-block on `safe: false` steps until a human approves. That gate is,
-in this port, still an ordinary conversational instruction to the model
-(see harness/agent.py's system prompt) — the same as in the source system,
-which also has no hard enforcement of it (Claude Code running the real
-skill trusts the model to ask before calling a write command). See
-README "Present Plan & Confirm: a considered, not-implemented, gate" for
-why we did not wire this to DeepAgents' `interrupt_on` instead.
+Update: the real Orchestration Protocol Step 4 ("Present Plan & Confirm")
+gate this tool itself still can't enforce (this function has no concept
+of "ask a human first," and never will — it's mechanical, not
+conversational) is now enforced one layer up instead, in `harness/agent.py`
+and `harness/sandbox.py`. In `ask`/`agent_plan`, `ShellSandboxMiddleware`
+hard-denies a call to this tool outright whenever the submitted plan
+contains an unsafe (`safe: false`) step — this tool's body never runs at
+all. In `agent_auto`, `_build_interrupt_on` (`harness/agent.py`) wires
+exactly the `interrupt_on` primitive an earlier version of this comment
+said was deliberately not used — the first such call in a session pauses
+for real human approval, via LangGraph's actual graph-pause mechanism,
+before this tool is ever invoked. Either way, by the time this function's
+code executes, the approval question has already been resolved by
+something outside it — see poc-wiki/execution-modes/decision.md.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -38,6 +44,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from langchain_core.tools import tool
+from langgraph.config import get_stream_writer
 
 from deepagents.backends.protocol import SandboxBackendProtocol
 from harness.sandbox import scrub
@@ -149,7 +156,7 @@ def make_run_execution_plan_tool(backend: SandboxBackendProtocol):
     """
 
     @tool
-    def run_execution_plan(plan_json: str, inputs_json: str = "{}") -> str:
+    async def run_execution_plan(plan_json: str, inputs_json: str = "{}") -> str:
         """Execute a Canonical Execution Plan (see
         skills/cyber-sierra/_internal/planner/references/execution-plan-schema.md)
         against the real cybersierra CLI, one step at a time, halting on the
@@ -167,6 +174,15 @@ def make_run_execution_plan_tool(backend: SandboxBackendProtocol):
         Returns:
             JSON-encoded `{"result": ExecutionResult, "executionLog": ExecutionLogEntry[]}`.
         """
+        # async, not sync, specifically so get_stream_writer() below actually
+        # works: confirmed empirically that a sync @tool function dispatched
+        # through this harness's real graph loses the stream-writer's context
+        # entirely (silently -- no error, no emission), regardless of whether
+        # its own body is offloaded to a thread. backend.execute() itself is
+        # still a blocking call (subprocess.run under the hood), so it's
+        # offloaded via asyncio.to_thread below rather than called directly,
+        # to avoid blocking this process's one event loop for the duration of
+        # each CLI subprocess call.
         plan = json.loads(plan_json)
         inputs = json.loads(inputs_json)
         steps = sorted(plan["steps"], key=lambda s: s["id"])
@@ -184,6 +200,11 @@ def make_run_execution_plan_tool(backend: SandboxBackendProtocol):
         steps_completed = 0
         steps_failed = 0
         final_output: Any = None
+        # Safe to call even when nothing's listening (confirmed empirically --
+        # a no-op, not an error, if the caller's astream_events didn't request
+        # stream_mode="custom"). See harness/agent.py's stream() for the
+        # consuming side (PlanStepFinished).
+        stream_writer = get_stream_writer()
 
         for step in steps:
             step_id = step["id"]
@@ -241,6 +262,7 @@ def make_run_execution_plan_tool(backend: SandboxBackendProtocol):
                     steps_failed += 1
                     span.set_attribute("plan.status", "resolve_error")
                     span.set_error(str(exc))
+                    stream_writer({"stepId": step_id, "exitCode": -1, "success": False})
                     break
 
                 # The real CLI invocation itself is logged by
@@ -248,7 +270,11 @@ def make_run_execution_plan_tool(backend: SandboxBackendProtocol):
                 # — this is the same backend the agent's own `execute` tool
                 # calls go through, so a plan step and an ad-hoc tool call are
                 # both visible in the same cli_call_* log stream.
-                response = backend.execute(resolved_command)
+                # Offloaded to a thread -- see this function's own docstring
+                # comment for why (backend.execute is a blocking subprocess
+                # call; this function is async now specifically so the
+                # stream_writer emissions below actually work).
+                response = await asyncio.to_thread(backend.execute, resolved_command)
                 stdout, stderr = _split_stderr(response.output)
                 success = response.exit_code == 0
                 logger.info(
@@ -282,6 +308,7 @@ def make_run_execution_plan_tool(backend: SandboxBackendProtocol):
                     "timestamp": timestamp,
                 }
                 execution_log.append(entry)
+                stream_writer({"stepId": step_id, "exitCode": response.exit_code, "success": success})
 
                 if success:
                     steps_completed += 1

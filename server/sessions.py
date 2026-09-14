@@ -54,6 +54,12 @@ class SessionEntry:
     # session (re-)enters agent_auto via set_mode() -- a fresh entry into
     # Auto always re-gates once, per poc-wiki/execution-modes/decisions-log.md.
     write_unlocked: bool = False
+    # The pending HITLRequest (action_requests/review_configs) while a turn
+    # is paused on an AwaitingApproval event, else None. Set by server/app.py
+    # when a turn ends in AwaitingApproval; cleared on the next Done/Failed.
+    # Its presence is what gates /chat (409 while set -- a decision must be
+    # made first) and /chat/{id}/decide (404/409 if nothing is pending).
+    pending_approval: dict | None = None
 
 
 class SessionStore:

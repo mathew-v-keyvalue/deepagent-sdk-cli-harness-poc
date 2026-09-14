@@ -32,12 +32,14 @@ from pathlib import Path
 from typing import Any
 
 from deepagents import create_deep_agent
+from langchain.agents.middleware.human_in_the_loop import InterruptOnConfig
 from langchain_core.messages import AIMessageChunk, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from harness.executor_tool import make_run_execution_plan_tool
 from harness.model import resolve_model
-from harness.sandbox import AllowlistedShellBackend, ShellSandboxMiddleware, scrub
+from harness.sandbox import AllowlistedShellBackend, ShellSandboxMiddleware, _plan_has_unsafe_step, scrub
 from harness.tracing import Netra, SpanType, trace_content_enabled
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -213,6 +215,67 @@ _INJECT_ENV_VAR = "CYBERSIERRA_INJECT_ACCESS_TOKEN"
 GRAPH_RECURSION_LIMIT = 500
 
 
+def _is_skill_write_request(request: Any) -> bool:
+    """`interrupt_on`'s `when` predicate operates on a `ToolCallRequest`,
+    not the raw `(name, args)` pair `ShellSandboxMiddleware._is_skill_write`
+    takes — this just unpacks one into the other so both call sites share
+    the same underlying path check (`skills/_generated/` detection), rather
+    than duplicating it.
+    """
+    tool_call = request.tool_call
+    return ShellSandboxMiddleware._is_skill_write(tool_call.get("name"), tool_call.get("args") or {})
+
+
+# Skill-writes always pause for approval, in every mode where they're even
+# reachable (agent_plan, agent_auto) — this is the one write-shaped action
+# that's deliberately *not* covered by agent_auto's one-time write_unlocked
+# shortcut (see poc-wiki/execution-modes/decisions-log.md's "Filesystem
+# writes / skill self-extension" section). One shared config: the predicate
+# only checks path, never session unlock state.
+_SKILL_WRITE_INTERRUPT = InterruptOnConfig(allowed_decisions=["approve", "reject"], when=_is_skill_write_request)
+
+
+def _build_interrupt_on(mode: str, write_unlocked: bool) -> dict[str, InterruptOnConfig] | None:
+    """The two independent `interrupt_on` gates this harness's modes need:
+
+    - `run_execution_plan`, only in `agent_auto` — the one-time-unlock gate.
+      Pauses only while `write_unlocked` is False AND the submitted plan
+      actually contains a write step; a read-only plan never pauses, and
+      once unlocked this session's future plans never pause again either.
+    - Skill-writes (`write_file`/`edit_file`/`delete` targeting
+      `skills/_generated/`), in both `agent_plan` and `agent_auto` — always
+      pauses, regardless of `write_unlocked`. In `agent_plan`, this is the
+      one exception to that mode's otherwise-hard-denied filesystem writes
+      (see `harness/sandbox.py`'s `ShellSandboxMiddleware._decide` — it lets
+      a skill-write through specifically so it can reach this gate instead
+      of being denied outright).
+
+    Returns `None` for `ask` (no approval path exists there at all — writes
+    are hard-denied with nothing to pause).
+    """
+    if mode == "ask":
+        return None
+    if mode == "agent_plan":
+        return {"write_file": _SKILL_WRITE_INTERRUPT, "edit_file": _SKILL_WRITE_INTERRUPT, "delete": _SKILL_WRITE_INTERRUPT}
+    if mode == "agent_auto":
+
+        def _run_execution_plan_predicate(request: Any) -> bool:
+            if write_unlocked:
+                return False
+            tool_call = request.tool_call
+            return _plan_has_unsafe_step(tool_call.get("args") or {})
+
+        return {
+            "run_execution_plan": InterruptOnConfig(
+                allowed_decisions=["approve", "reject"], when=_run_execution_plan_predicate
+            ),
+            "write_file": _SKILL_WRITE_INTERRUPT,
+            "edit_file": _SKILL_WRITE_INTERRUPT,
+            "delete": _SKILL_WRITE_INTERRUPT,
+        }
+    raise ValueError(f"unknown mode {mode!r}")
+
+
 def _build_agent(
     access_token: str = "",
     *,
@@ -230,14 +293,20 @@ def _build_agent(
     intentionally shared across calls, since it's what makes session
     continuity possible at all.
 
-    `mode` now gates `ShellSandboxMiddleware`'s hard-deny branches (write-
-    shaped tool calls denied outright in `ask`/`agent_plan`, unchanged in
-    `agent_auto` — see `harness/sandbox.py`). `write_unlocked` is still
-    unused here — it only matters once `agent_auto`'s `interrupt_on`
-    one-time-unlock gate is wired in a later change (see
-    poc-wiki/execution-modes/architecture-changes.md); accepted now so
-    callers (`stream()`, `server/app.py`) don't need a second signature
-    change once that lands.
+    `mode` gates `ShellSandboxMiddleware`'s hard-deny branches (write-shaped
+    tool calls denied outright in `ask`/`agent_plan`, unchanged in
+    `agent_auto` — see `harness/sandbox.py`) *and* determines this call's
+    `interrupt_on` config (see `_build_interrupt_on` above) — the real
+    approval-pause primitive, wired through `deepagents.create_deep_agent`'s
+    own `interrupt_on` param straight into LangChain's
+    `HumanInTheLoopMiddleware`. `write_unlocked` feeds
+    `_build_interrupt_on`'s `agent_auto` predicate: while `False`, the first
+    write-shaped `run_execution_plan` call this session submits pauses;
+    once a caller resumes with an approve decision (see `stream()`'s
+    `decision` param) and `server/app.py` sets `write_unlocked = True` on
+    the session before resuming, subsequent turns built via this function
+    stop pausing on ordinary writes — skill-writes are the one exception,
+    covered separately and unconditionally by `_SKILL_WRITE_INTERRUPT`.
 
     Whether `access_token` actually becomes this call's cybersierra
     identity is conditional, and that's a deliberate fix, not the original
@@ -351,6 +420,7 @@ def _build_agent(
         skills=[str(SKILLS_ROOT)],
         backend=backend,
         checkpointer=checkpointer if checkpointer is not None else _checkpointer,
+        interrupt_on=_build_interrupt_on(mode, write_unlocked),
     )
 
 
@@ -559,7 +629,46 @@ class Failed:
     message: str
 
 
-HarnessEvent = TextDelta | ToolUseStarted | Done | Failed
+@dataclass
+class AwaitingApproval:
+    """The turn paused mid-stream, waiting on a human decision — surfaces
+    whenever `graph.aget_state` shows a pending interrupt after the
+    `astream_events` loop below finishes (see `stream()`). `action_requests`
+    is lifted straight from the pending `HITLRequest`'s own field
+    (`{"name": str, "args": dict, "description": str | None}` per entry) —
+    same shape LangChain's `HumanInTheLoopMiddleware` already builds, not
+    reshaped here. Resuming: call `stream()` again with `decision` set."""
+
+    action_requests: list[dict[str, Any]]
+
+
+@dataclass
+class ToolUseFinished:
+    """A tool call's outcome — the counterpart `ToolUseStarted` never had.
+    Lets the client flip a "running" indicator to "done"/"failed" for a
+    specific call instead of only learning anything happened once the
+    whole turn's `Done`/`Failed` arrives."""
+
+    name: str
+    exit_code: int | None
+    success: bool
+
+
+@dataclass
+class PlanStepFinished:
+    """One step of a `run_execution_plan` call finishing, streamed live from
+    *inside* that single tool call — see `harness/executor_tool.py`'s
+    `get_stream_writer()` call in its step loop. Without this, `run_
+    execution_plan`'s multi-step loop is invisible to the client until the
+    whole plan finishes; this is what lets a pending-action card tick off
+    each step as it actually completes."""
+
+    step_id: int
+    exit_code: int
+    success: bool
+
+
+HarnessEvent = TextDelta | ToolUseStarted | Done | Failed | AwaitingApproval | ToolUseFinished | PlanStepFinished
 
 
 def _extract_text(message: AIMessageChunk) -> str:
@@ -589,6 +698,7 @@ async def stream(
     resume: str | None = None,
     mode: str = "agent_auto",
     write_unlocked: bool = False,
+    decision: dict[str, Any] | None = None,
 ) -> AsyncIterator[HarnessEvent]:
     """Run one turn, yielding incremental events as they arrive.
 
@@ -609,8 +719,17 @@ async def stream(
     `_build_agent`).
 
     `mode`/`write_unlocked` come from `server/app.py`'s `SessionEntry` and
-    are threaded straight through to `_build_agent` — see that function's
-    docstring for why they don't change this turn's behavior yet.
+    are threaded straight through to `_build_agent`, which uses them to
+    build this turn's `interrupt_on` config (see that function's docstring).
+
+    `decision` resumes a session that's currently paused on an
+    `AwaitingApproval` event instead of starting a fresh turn from `prompt`
+    — when set, `prompt` is ignored entirely and the graph is driven via
+    `Command(resume={"decisions": [decision]})` against the same
+    `thread_id`, matching `HumanInTheLoopMiddleware.after_model`'s own
+    `interrupt(hitl_request)["decisions"]` read-back exactly (see
+    `server/app.py`'s `/chat/{session_id}/decide` endpoint, the only caller
+    that should ever set this).
     """
     thread_id = session_id or resume
     if not thread_id:
@@ -649,9 +768,21 @@ async def stream(
             if trace_content_enabled():
                 Netra.set_root_input(scrub(prompt, access_token))
             try:
-                async for event in graph.astream_events(
-                    {"messages": [HumanMessage(content=prompt)]}, config, version="v2"
-                ):
+                # A resume (decision set) drives the graph via Command(resume=...)
+                # against the same thread_id instead of a fresh HumanMessage --
+                # prompt is ignored entirely in that case. See this function's
+                # docstring for the exact shape this must match.
+                graph_input: Any = (
+                    Command(resume={"decisions": [decision]})
+                    if decision is not None
+                    else {"messages": [HumanMessage(content=prompt)]}
+                )
+                # stream_mode="custom" is required for harness/executor_tool.py's
+                # get_stream_writer() emissions (PlanStepFinished, below) to
+                # surface at all -- confirmed empirically these are silently
+                # dropped without it. Doesn't suppress any of the standard
+                # on_chat_model_*/on_tool_* events already handled below.
+                async for event in graph.astream_events(graph_input, config, version="v2", stream_mode="custom"):
                     llm_tracker.observe(event)
                     kind = event["event"]
                     if kind == "on_chat_model_stream":
@@ -671,24 +802,54 @@ async def stream(
                                 if match:
                                     actual_commands_seen.append(" ".join(match.groups()))
                         yield ToolUseStarted(event["name"], event["data"].get("input"))
-                    elif kind == "on_tool_end" and event["name"] in ("run_execution_plan", "execute"):
-                        # Counterpart to the on_tool_start branch above: reads
-                        # the tool's actual return value (real output), not
-                        # its planned input — feeds agent.actual_outputs
-                        # below, the grounding context the Netra eval track's
-                        # Hallucination evaluator checks the final answer
-                        # against. In practice the model calls `execute`
-                        # directly (confirmed live — not `run_execution_plan`,
-                        # despite an earlier comment assuming otherwise);
-                        # `execute`'s ToolMessage.content is already the raw
-                        # CLI output text, no JSON envelope to parse.
+                    elif kind == "on_tool_end":
+                        # ToolUseFinished fires for every tool call (the live
+                        # per-command status map this is for needs every
+                        # call's outcome, not just run_execution_plan/execute)
+                        # -- the eval-grounding extraction below stays scoped
+                        # to those two names specifically, unchanged.
                         tool_output = event["data"].get("output")
                         output_text = getattr(tool_output, "content", tool_output)
-                        if isinstance(output_text, str):
-                            if event["name"] == "run_execution_plan":
-                                actual_outputs_seen += _extract_plan_outputs(output_text)
-                            else:
-                                actual_outputs_seen.append(output_text)
+                        tool_status = getattr(tool_output, "status", None)  # LangChain's "success"/"error", not a numeric code
+                        yield ToolUseFinished(
+                            name=event["name"],
+                            exit_code=None,  # ToolMessage carries no numeric exit code -- tool_status is the closest signal
+                            success=tool_status != "error",
+                        )
+                        if event["name"] in ("run_execution_plan", "execute"):
+                            # Counterpart to the on_tool_start branch above: reads
+                            # the tool's actual return value (real output), not
+                            # its planned input — feeds agent.actual_outputs
+                            # below, the grounding context the Netra eval track's
+                            # Hallucination evaluator checks the final answer
+                            # against. In practice the model calls `execute`
+                            # directly (confirmed live — not `run_execution_plan`,
+                            # despite an earlier comment assuming otherwise);
+                            # `execute`'s ToolMessage.content is already the raw
+                            # CLI output text, no JSON envelope to parse.
+                            if isinstance(output_text, str):
+                                if event["name"] == "run_execution_plan":
+                                    actual_outputs_seen += _extract_plan_outputs(output_text)
+                                else:
+                                    actual_outputs_seen.append(output_text)
+                    elif kind == "on_chain_stream" and event.get("name") == "LangGraph":
+                        # Confirmed empirically (not documented): a get_stream_writer()
+                        # emission surfaces as on_chain_stream/name="LangGraph" with
+                        # the raw written value under data["chunk"] -- NOT as
+                        # on_custom_event, which never fires for this. "LangGraph"
+                        # is the compiled graph's own name, distinguishing this from
+                        # a node-level on_chain_stream (which uses that node's name
+                        # instead) -- the isinstance/key check below is a second,
+                        # belt-and-braces filter for the same reason. Emitted by
+                        # harness/executor_tool.py's run_execution_plan loop via
+                        # get_stream_writer() -- the one place a single tool call's
+                        # internal step-by-step progress becomes visible mid-call,
+                        # not just at its start/end.
+                        chunk = event["data"].get("chunk")
+                        if isinstance(chunk, dict) and "stepId" in chunk:
+                            yield PlanStepFinished(
+                                step_id=chunk["stepId"], exit_code=chunk["exitCode"], success=chunk["success"]
+                            )
                     elif kind == "on_chat_model_end":
                         num_turns += 1
                         message = event["data"]["output"]
@@ -698,6 +859,27 @@ async def stream(
                         for key, value in (getattr(message, "usage_metadata", None) or {}).items():
                             if isinstance(value, int):
                                 usage_totals[key] = usage_totals.get(key, 0) + value
+
+                # A pending interrupt means the graph paused mid-turn (e.g. the
+                # one-time write-approval gate) rather than actually finishing --
+                # checked via graph state, not by catching an exception, since a
+                # checkpointer-backed interrupt doesn't raise to the caller (see
+                # poc-wiki/execution-modes/architecture-changes.md's "Detecting
+                # the pause / resuming" section for why this is the documented
+                # way to tell, independent of astream_events' own event shape).
+                state = await graph.aget_state(config)
+                pending_interrupts = [i for task in state.tasks for i in (task.interrupts or ())]
+                if pending_interrupts:
+                    hitl_request = pending_interrupts[0].value
+                    logger.info(
+                        "approval_paused thread_id=%s",
+                        thread_id,
+                        extra={"event": "approval_paused", "thread_id": thread_id},
+                    )
+                    span.set_attribute("agent.status", "awaiting_approval")
+                    span.set_success()
+                    yield AwaitingApproval(action_requests=hitl_request.get("action_requests", []))
+                    return
 
                 # After the run, not before — see the identical comment in run()
                 # for why this ordering matters (before_agent hasn't populated

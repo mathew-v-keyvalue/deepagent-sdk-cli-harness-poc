@@ -55,7 +55,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from harness.agent import Done, Failed, TextDelta, ToolUseStarted, stream
+from harness.agent import (
+    AwaitingApproval,
+    Done,
+    Failed,
+    PlanStepFinished,
+    TextDelta,
+    ToolUseFinished,
+    ToolUseStarted,
+    stream,
+)
 from harness.observability import configure_logging
 from harness.startup_checks import assert_mode_dependencies_compatible
 from harness.tracing import init_tracing
@@ -146,6 +155,51 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+async def _dispatch_harness_events(harness_events, session_id: str, entry) -> AsyncIterator[str]:
+    """Shared SSE translation for both `/chat` and `/chat/{id}/decide` — the
+    two callers differ only in how they build `harness_events` (a fresh
+    prompt vs. a resume decision); everything downstream of that is
+    identical. `entry` is mutated directly (`pending_approval`), same
+    object `store` holds, so callers don't need to re-fetch/re-save it.
+    """
+    async for event in harness_events:
+        if isinstance(event, TextDelta):
+            yield _sse("delta", {"text": event.text})
+        elif isinstance(event, ToolUseStarted):
+            yield _sse("tool_use", {"name": event.name, "args": event.args or {}})
+        elif isinstance(event, ToolUseFinished):
+            yield _sse("tool_use_finished", {"name": event.name, "exit_code": event.exit_code, "success": event.success})
+        elif isinstance(event, PlanStepFinished):
+            yield _sse(
+                "plan_step_finished",
+                {"step_id": event.step_id, "exit_code": event.exit_code, "success": event.success},
+            )
+        elif isinstance(event, AwaitingApproval):
+            # Recorded so /chat (409) and /decide (404/409) can both check
+            # it without re-deriving anything from the harness itself --
+            # see server/sessions.py's SessionEntry.pending_approval.
+            entry.pending_approval = {"action_requests": event.action_requests}
+            yield _sse("awaiting_approval", {"actions": event.action_requests})
+        elif isinstance(event, Done):
+            entry.pending_approval = None
+            store.touch(session_id)
+            yield _sse(
+                "done",
+                {
+                    "session_id": event.session_id,
+                    "subtype": event.subtype,
+                    "total_cost_usd": event.total_cost_usd,
+                    "usage": event.usage,
+                    "num_turns": event.num_turns,
+                },
+            )
+        elif isinstance(event, Failed):
+            entry.pending_approval = None
+            if event.code == "session_expired":
+                store.drop(session_id)
+            yield _sse("error", {"code": event.code, "message": event.message})
+
+
 @app.post("/chat", dependencies=[Depends(_verify_service_auth)])
 async def chat(
     message: str = Form(...),
@@ -194,6 +248,16 @@ async def chat(
                     }
                 },
             )
+        elif entry.pending_approval is not None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "awaiting_approval",
+                        "message": "this session is paused awaiting a decision -- call /chat/{session_id}/decide first",
+                    }
+                },
+            )
         elif entry.mode != mode:
             # A later message on the same session asked for a different
             # mode -- switching mode is just "send your next message with a
@@ -216,28 +280,80 @@ async def chat(
                 harness_events = stream(
                     message, access_token, resume=session_id, mode=entry.mode, write_unlocked=entry.write_unlocked
                 )
+            async for chunk in _dispatch_harness_events(harness_events, session_id, entry):
+                yield chunk
+        finally:
+            entry.lock.release()
 
-            async for event in harness_events:
-                if isinstance(event, TextDelta):
-                    yield _sse("delta", {"text": event.text})
-                elif isinstance(event, ToolUseStarted):
-                    yield _sse("tool_use", {"name": event.name, "args": event.args or {}})
-                elif isinstance(event, Done):
-                    store.touch(session_id)
-                    yield _sse(
-                        "done",
-                        {
-                            "session_id": event.session_id,
-                            "subtype": event.subtype,
-                            "total_cost_usd": event.total_cost_usd,
-                            "usage": event.usage,
-                            "num_turns": event.num_turns,
-                        },
-                    )
-                elif isinstance(event, Failed):
-                    if event.code == "session_expired":
-                        store.drop(session_id)
-                    yield _sse("error", {"code": event.code, "message": event.message})
+    return StreamingResponse(event_source(), media_type="text/event-stream")
+
+
+_VALID_DECISIONS = {"approve", "reject"}
+
+
+@app.post("/chat/{session_id}/decide", dependencies=[Depends(_verify_service_auth)])
+async def decide(
+    session_id: str,
+    decision: str = Form(...),
+    # Only meaningful for "reject" -- becomes the rejected tool call's
+    # synthesized result content (see LangChain's RejectDecision shape).
+    message: str = Form(""),
+    access_token: str = Form(""),
+):
+    """Resume a session currently paused on an `awaiting_approval` event.
+
+    The only caller of `harness.agent.stream`'s `decision` param — see that
+    function's docstring for the exact resume mechanics. Setting
+    `write_unlocked = True` here (on approve, before resuming) is what makes
+    `agent_auto`'s one-time-unlock behavior actually one-time: the next
+    `_build_agent()` call for this session (triggered by the resume below,
+    and every `/chat` call after it) reads the now-`True` value straight
+    from `entry.write_unlocked` -- no separate flag-passing needed. Skill-
+    write approvals ignore this entirely (their `interrupt_on` predicate
+    never checks `write_unlocked` -- see `harness/agent.py`'s
+    `_build_interrupt_on`), so setting it here is harmless, not just
+    correct, for that case too.
+    """
+    if decision not in _VALID_DECISIONS:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_decision", "message": f"decision must be one of {sorted(_VALID_DECISIONS)}"},
+        )
+
+    entry = store.get(session_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "unknown_session", "message": f"no session {session_id!r}"},
+        )
+    if entry.pending_approval is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "not_awaiting_approval", "message": "this session has no pending decision"},
+        )
+    if entry.lock.locked():
+        return JSONResponse(
+            status_code=409,
+            content={"error": {"code": "session_busy", "message": "a turn is already in flight for this session"}},
+        )
+
+    if decision == "approve":
+        entry.write_unlocked = True
+    decision_payload = {"type": decision} if decision == "approve" else {"type": decision, "message": message}
+
+    async def event_source() -> AsyncIterator[str]:
+        await entry.lock.acquire()
+        try:
+            harness_events = stream(
+                "",
+                access_token,
+                resume=session_id,
+                mode=entry.mode,
+                write_unlocked=entry.write_unlocked,
+                decision=decision_payload,
+            )
+            async for chunk in _dispatch_harness_events(harness_events, session_id, entry):
+                yield chunk
         finally:
             entry.lock.release()
 
