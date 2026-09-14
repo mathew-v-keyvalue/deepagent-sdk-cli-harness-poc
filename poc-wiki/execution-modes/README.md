@@ -11,7 +11,13 @@ two-level set of modes, requested by product: something like Cursor's
 Ask/Agent/Manual split, or Claude Code's Plan Mode vs default vs
 auto-accept.
 
-## Read these in order
+## Start here
+
+**[decision.md](decision.md)** — the final, standalone proposal and
+decision record. Everything below is the working detail behind it; this
+is the one document to hand to someone who wasn't in the room.
+
+## Read these in order for the full backing detail
 
 1. **[mode-design.md](mode-design.md)** — what "modes" mean on two other
    platforms (Cursor, Claude Code), and the agreed two-level shape for
@@ -29,6 +35,10 @@ auto-accept.
    driver (the approval round-trip), cross-repo coordination needed, and
    why the shell sandbox's known prefix-matching gap matters more once
    Auto mode is a named, user-facing mode.
+5. **[decisions-log.md](decisions-log.md)** — settled answers from the
+   pre-build walkthrough (session state, recent chat, user permission,
+   monitoring, partial responses) — what's decided, distinct from what's
+   still open above.
 
 ## The one-paragraph version
 

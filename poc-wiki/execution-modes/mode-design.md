@@ -35,6 +35,12 @@ Not three flat, parallel modes — a two-level split:
   path, deliberately mirroring Claude Code's Plan Mode (you exit the mode
   to unlock execution; you don't approve your way into an edit while
   still in it).
+  **One resolved exception** (see `decisions-log.md`): a write targeting
+  `skills/_generated/` — i.e. the model proposing to learn a new skill —
+  *can* pause for approval right here in Plan mode, without switching to
+  Auto. This is deliberately narrower than "Plan can write things": every
+  other filesystem write (`write_file`/`edit_file`/`delete` anywhere
+  else) stays hard-denied, same as Ask.
 - **Agent → Auto** — full tool access, matching today's behavior. The
   first write-shaped call in a session — specifically, the first
   `run_execution_plan` call containing a step marked `"safe": false` —

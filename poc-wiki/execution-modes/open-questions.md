@@ -1,5 +1,14 @@
 # Open questions and risks
 
+## RESOLVED: filesystem-write gating — see `decisions-log.md`
+
+Was flagged "must address before build" — now decided. Skill-writing
+(`write_file`/`edit_file`/`delete` targeting `skills/_generated/`) gets
+its own always-ask treatment, distinct from and stricter than ordinary
+CLI writes; everything else stays hard-denied in `ask`/`agent_plan`. Full
+reasoning and the per-mode table are in `decisions-log.md`'s "Filesystem
+writes / skill self-extension" section.
+
 ## The approval round-trip is the real effort, not the sandboxing
 
 Everything about deciding "is this call allowed in this mode" is already
@@ -9,6 +18,41 @@ and a frontend that understands both. This was scoped out previously for
 exactly this reason (see README.md's "Present Plan & Confirm" section) —
 it's a real, non-trivial addition to the streaming contract, not a
 config change.
+
+## User permission: not ours to enforce, but "forbidden" needs its own failure state
+
+Per-user authorization (can this specific user actually do X) is already
+handled downstream — the real cybersierra backend enforces it on every
+call via the forwarded JWT, independent of anything this harness does.
+We don't need to duplicate that decision.
+
+What we *don't* have is a pre-flight version of it. Checked directly:
+`cybersierra manifest` (`skills/cyber-sierra/_internal/shared/manifest-
+usage.md`) returns a static catalog of every command, tagged `safe: true/
+false` (read/write) — the same output for every caller regardless of
+token. It is not scoped to what the calling user is actually entitled to
+do. So a plan can be built entirely out of commands that exist and look
+safe on paper, and still fail mid-execution because this particular user
+isn't allowed to run one of them.
+
+The system already half-anticipates this: `harness/executor_tool.py`'s
+`EXIT_CODE_MEANING` table already has `4: "forbidden"` as a distinct,
+named outcome — but today it's handled exactly like any other failure:
+the plan halts on the first non-zero exit code, no special messaging, no
+"here's what already succeeded before we hit this."
+
+Two genuinely separate follow-ups, not one:
+1. **A real pre-flight entitlements check** would need a new API from the
+   backend team (a "what can this token actually do" endpoint) — this
+   isn't something we can build from our side; worth raising with them as
+   a separate ask, not scoped into this work.
+2. **Treating `forbidden` (exit_code=4) as its own distinct failure
+   state** — buildable now, independent of #1: when a plan halts on a
+   forbidden step, tell the user specifically *that's* why (not a generic
+   error), and surface whatever earlier steps in the same plan already
+   completed successfully, instead of just reporting failure. This is
+   part of the "failure states" design work, not the permission-gating
+   work.
 
 ## Should ad-hoc `execute` also be gated in Agent → Auto?
 
