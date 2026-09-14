@@ -181,22 +181,36 @@ _INJECT_ENV_VAR = "CYBERSIERRA_INJECT_ACCESS_TOKEN"
 # 60, then 120, both still failed live on one particular query ("list
 # unread notifications" -- see logs/harness.log thread_id=91b62ab5-...),
 # each time after only ~8-9 logged tool calls. That first looked like a
-# fixed per-action middleware-overhead multiplier, but isolated replay
-# disproved that: instrumenting graph.astream_events() directly (counting
-# on_chain_start/on_tool_start events, not just this harness's own
-# tool_call_* logging) showed the SAME prompt, run standalone and also
-# reproduced as the exact "Hi" -> notifications two-turn sequence that
-# failed live, both completing normally in ~20 model rounds / ~40 total
-# graph steps -- comfortably under even the original 60. So this is
-# run-to-run variance in how many rounds the model needs to converge on
-# this manifest-driven CLI's command surface, not a fixed multiplier and
-# not an infinite loop: most trajectories are cheap, but an unlucky one
-# (extra reasoning-only rounds, or a malformed-tool-call retry caught by
-# DeepAgents' own PatchToolCallsMiddleware) can still run well past 120.
-# Raised again, further, for headroom over the one observed live failure
-# at 120 -- not a guarantee no trajectory ever exceeds this, just a wider
-# margin against the variance actually observed.
-GRAPH_RECURSION_LIMIT = 200
+# fixed per-action middleware-overhead multiplier, but isolated replay at
+# the time (instrumenting graph.astream_events() directly, counting
+# on_chain_start/on_tool_start events) seemed to disprove that, showing
+# ~20 model rounds / ~40 total graph steps for an equivalent prompt --
+# comfortably under 60. Raised to 200 on that basis (a wide margin over an
+# assumed ~2-steps-per-round cost), which is what shipped for a long time.
+#
+# 2026-09-11: that ~2-steps-per-round assumption was wrong, found via real
+# Netra-traced eval runs, not another isolated replay. Every "Recursion
+# limit of 200 reached" failure examined (11 of 25 items in one run, all
+# with concurrency=1 so not a race condition) hit the ceiling at *exactly*
+# 12 "model" graph-node executions every time, regardless of how many or
+# how few real CLI calls happened inside those 12 rounds -- including
+# after fixing the agent's discovery behavior (skills/cyber-sierra/SKILL.md,
+# same date) to use clean `--help`-based lookups instead of hand-rolled,
+# sometimes-buggy `manifest --raw | python3 -c ...` one-liners. The fixed
+# failure point despite materially different, cleaner per-round behavior
+# is what rules out "wasted rounds" as the cause: counting actual span
+# data per round (7 middlewares x abefore_model+aafter_model + 1 model
+# node = 15 steps, confirmed against the real trace's own span timestamps)
+# gives 2 (one-time prologue) + 12*15 + ~15 tool-node steps =~ 197-200 --
+# matching the observed cutoff exactly. So the real cost is ~15-16 steps
+# per model round, not ~2, and 200 only ever bought ~12 real rounds --
+# too few for any query needing more than one or two `--help` lookups plus
+# a data call plus a second resource, which several of these dataset items
+# genuinely do even when the agent behaves efficiently.
+#
+# Recomputed from that measured per-round cost, not guessed: to give ~25-30
+# real model rounds of headroom (25-30 * 16 =~ 450-490), rounded to 500.
+GRAPH_RECURSION_LIMIT = 500
 
 
 def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None = None):
