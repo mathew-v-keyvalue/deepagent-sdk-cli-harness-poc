@@ -54,6 +54,7 @@ not a DeepAgents-specific gap.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import PurePosixPath
@@ -200,6 +201,29 @@ def _denial_message(command: str) -> str:
     )
 
 
+# Modes where write-shaped tool calls are hard-denied at this layer, rather
+# than reaching agent_auto's interrupt_on pause (harness/agent.py) -- see
+# poc-wiki/execution-modes/mode-design.md. "ask" and "agent_plan" both stop
+# here; only "agent_auto" ever lets a write-shaped call through this
+# middleware unconditionally allowed.
+READ_ONLY_MODES: tuple[str, ...] = ("ask", "agent_plan")
+
+
+def _plan_has_unsafe_step(args: dict[str, Any]) -> bool:
+    """True if a `run_execution_plan` call's `plan_json` argument contains
+    any step with `"safe": false` (execution-plan-schema.md's own read/write
+    signal), or if `plan_json` can't be parsed as a plan at all --
+    unparseable input fails safe (treated as unsafe) rather than silently
+    passing through a read-only mode's hard gate.
+    """
+    try:
+        plan = json.loads(str(args.get("plan_json", "")))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return True
+    steps = plan.get("steps", []) if isinstance(plan, dict) else []
+    return any(isinstance(step, dict) and step.get("safe") is False for step in steps)
+
+
 class AllowlistedShellBackend(LocalShellBackend):
     """``LocalShellBackend`` with a deny-by-default command allowlist.
 
@@ -311,26 +335,41 @@ class ShellSandboxMiddleware(AgentMiddleware):
     second check is a no-op; it exists so that adding a new tool without
     updating this allowlist fails closed, not open.
 
-    ``run_execution_plan`` is treated as an ordinary known-safe tool here —
-    pre-existing bug fix, nothing mode-aware yet: it was previously reachable
-    by neither the ``execute`` branch nor ``_KNOWN_SAFE_TOOLS``, so every
-    call to it was denied outright, in every mode, unconditionally. Mode-
-    aware gating (hard-deny in read-only modes, pausing via ``interrupt_on``
-    in ``agent_auto``) is layered on top of this in a later change.
+    ``run_execution_plan`` reaching this middleware's known-safe path at all
+    was a separate, pre-existing bug fix (see git history) — it was
+    previously reachable by neither the ``execute`` branch nor
+    ``_KNOWN_SAFE_TOOLS``, so every call to it was denied outright, in every
+    mode, unconditionally.
+
+    ``mode`` (one of ``"ask"``, ``"agent_plan"``, ``"agent_auto"`` — see
+    ``poc-wiki/execution-modes/mode-design.md``) hard-denies write-shaped
+    tool calls (``execute``, ``run_execution_plan`` with an unsafe step,
+    ``write_file``/``edit_file``/``delete``) in ``READ_ONLY_MODES``. This is
+    a separate, independent mechanism from ``agent_auto``'s one-time
+    ``interrupt_on`` pause (``harness/agent.py``): this layer either denies
+    a call outright or lets it through unchanged; it never pauses one
+    itself. One case is transitional here: a write targeting
+    ``skills/_generated/`` (the model persisting a self-extension skill) is
+    hard-denied in ``agent_plan`` the same as any other write for now — its
+    approval exception is wired in a later change, once ``interrupt_on`` is
+    available to that mode too (see ``poc-wiki/execution-modes/
+    decisions-log.md``'s "Filesystem writes / skill self-extension" section).
     """
 
     name = "ShellSandboxMiddleware"
 
-    _KNOWN_SAFE_TOOLS = frozenset(
-        {"ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "task", "run_execution_plan"}
-    )
+    _KNOWN_SAFE_TOOLS = frozenset({"ls", "read_file", "glob", "grep", "task"})
 
-    def __init__(self, *, redact: str | None = None) -> None:
+    _WRITE_SHAPED_FS_TOOLS = frozenset({"write_file", "edit_file", "delete"})
+
+    def __init__(self, *, redact: str | None = None, mode: str = "agent_auto") -> None:
         """`redact`, if given, is scrubbed from this middleware's own log
         lines only — see `AllowlistedShellBackend.__init__` for why. Pass
-        the current request's `access_token`."""
+        the current request's `access_token`. `mode` gates write-shaped
+        tool calls per `READ_ONLY_MODES` above."""
         super().__init__()
         self._redact = redact
+        self._mode = mode
 
     @staticmethod
     def _is_skill_read(name: str | None, args: dict[str, Any]) -> str | None:
@@ -349,6 +388,20 @@ class ShellSandboxMiddleware(AgentMiddleware):
             return None
         parts = PurePosixPath(path.replace("\\", "/")).parts
         return parts[-2] if len(parts) >= 2 else path
+
+    @staticmethod
+    def _is_skill_write(name: str | None, args: dict[str, Any]) -> bool:
+        """True if this is a `write_file`/`edit_file`/`delete` call whose
+        path targets `skills/_generated/` — i.e. the model persisting a
+        self-extension skill (R4/"Reflection"), not an ordinary filesystem
+        write. Write-side mirror of `_is_skill_read`'s path inspection;
+        returns a plain bool (not a skill name) since the mode-aware
+        decision below only needs yes/no.
+        """
+        if name not in ShellSandboxMiddleware._WRITE_SHAPED_FS_TOOLS:
+            return False
+        path = str(args.get("file_path", "")).replace("\\", "/")
+        return "skills/_generated/" in path
 
     def _decide(self, request: "ToolCallRequest") -> ToolMessage | None:
         """Shared sync/async decision logic. Returns a denial `ToolMessage`
@@ -371,6 +424,27 @@ class ShellSandboxMiddleware(AgentMiddleware):
 
         if name == "execute":
             command = str(args.get("command", ""))
+            if self._mode in READ_ONLY_MODES:
+                logger.warning(
+                    "tool_call_denied name=execute mode=%r command=%r (ad-hoc shell unavailable in read-only mode)",
+                    self._mode,
+                    scrub(command, self._redact),
+                    extra={
+                        "event": "tool_call_denied",
+                        "tool_name": name,
+                        "mode": self._mode,
+                        "command": scrub(command, self._redact),
+                    },
+                )
+                return ToolMessage(
+                    content=(
+                        f"Error: ad-hoc shell commands aren't available in {self._mode!r} mode. "
+                        "Use run_execution_plan with read-only steps for lookups instead."
+                    ),
+                    name=name,
+                    tool_call_id=tool_call["id"],
+                    status="error",
+                )
             if not is_command_allowed(command):
                 logger.warning(
                     "tool_call_denied name=execute command=%r",
@@ -387,6 +461,64 @@ class ShellSandboxMiddleware(AgentMiddleware):
                 "tool_call_allowed name=execute command=%r",
                 scrub(command, self._redact),
                 extra={"event": "tool_call_allowed", "tool_name": name, "command": scrub(command, self._redact)},
+            )
+            return None
+
+        if name == "run_execution_plan":
+            if self._mode in READ_ONLY_MODES and _plan_has_unsafe_step(args):
+                logger.warning(
+                    "tool_call_denied name=run_execution_plan mode=%r (unsafe step in read-only mode)",
+                    self._mode,
+                    extra={"event": "tool_call_denied", "tool_name": name, "mode": self._mode},
+                )
+                return ToolMessage(
+                    content=(
+                        f"Error: this plan contains a write step (\"safe\": false), which isn't "
+                        f"available in {self._mode!r} mode. Present the plan to the user and ask "
+                        "them to switch to Agent Auto mode before it can run."
+                    ),
+                    name=name,
+                    tool_call_id=tool_call["id"],
+                    status="error",
+                )
+            logger.info(
+                "tool_call_allowed name=run_execution_plan mode=%r",
+                self._mode,
+                extra={"event": "tool_call_allowed", "tool_name": name, "mode": self._mode},
+            )
+            return None
+
+        if name in self._WRITE_SHAPED_FS_TOOLS:
+            if self._mode in READ_ONLY_MODES:
+                is_skill_write = self._is_skill_write(name, args)
+                # Transitional: agent_plan hard-denies a skill-write here too,
+                # same as any other write, until interrupt_on is wired for
+                # this mode (see class docstring) -- is_skill_write is
+                # already logged now so the distinction is visible ahead of
+                # that change, even though the decision doesn't differ yet.
+                logger.warning(
+                    "tool_call_denied name=%r mode=%r is_skill_write=%s (filesystem write unavailable in read-only mode)",
+                    name,
+                    self._mode,
+                    is_skill_write,
+                    extra={
+                        "event": "tool_call_denied",
+                        "tool_name": name,
+                        "mode": self._mode,
+                        "is_skill_write": is_skill_write,
+                    },
+                )
+                return ToolMessage(
+                    content=f"Error: filesystem writes aren't available in {self._mode!r} mode.",
+                    name=name,
+                    tool_call_id=tool_call["id"],
+                    status="error",
+                )
+            logger.info(
+                "tool_call_allowed name=%r mode=%r",
+                name,
+                self._mode,
+                extra={"event": "tool_call_allowed", "tool_name": name, "mode": self._mode},
             )
             return None
 

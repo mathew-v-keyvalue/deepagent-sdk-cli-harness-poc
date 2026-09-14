@@ -230,14 +230,14 @@ def _build_agent(
     intentionally shared across calls, since it's what makes session
     continuity possible at all.
 
-    `mode`/`write_unlocked` are accepted and threaded through starting here,
-    but not yet wired into `create_deep_agent(...)` differently below --
-    that's mode-aware gating (`ShellSandboxMiddleware`'s hard-deny branches)
-    and the `interrupt_on` one-time-unlock gate, both added in later changes
-    (see poc-wiki/execution-modes/architecture-changes.md). This function
-    still builds exactly today's single-mode graph regardless of what's
-    passed here; the parameters exist so callers (`stream()`, `server/
-    app.py`) don't need a second signature change once the gating lands.
+    `mode` now gates `ShellSandboxMiddleware`'s hard-deny branches (write-
+    shaped tool calls denied outright in `ask`/`agent_plan`, unchanged in
+    `agent_auto` — see `harness/sandbox.py`). `write_unlocked` is still
+    unused here — it only matters once `agent_auto`'s `interrupt_on`
+    one-time-unlock gate is wired in a later change (see
+    poc-wiki/execution-modes/architecture-changes.md); accepted now so
+    callers (`stream()`, `server/app.py`) don't need a second signature
+    change once that lands.
 
     Whether `access_token` actually becomes this call's cybersierra
     identity is conditional, and that's a deliberate fix, not the original
@@ -347,7 +347,7 @@ def _build_agent(
         model=resolve_model(),
         system_prompt=SYSTEM_PROMPT_APPENDIX,
         tools=[make_run_execution_plan_tool(backend)],
-        middleware=[ShellSandboxMiddleware(redact=access_token)],
+        middleware=[ShellSandboxMiddleware(redact=access_token, mode=mode)],
         skills=[str(SKILLS_ROOT)],
         backend=backend,
         checkpointer=checkpointer if checkpointer is not None else _checkpointer,
