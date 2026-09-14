@@ -303,19 +303,26 @@ class ShellSandboxMiddleware(AgentMiddleware):
     layer, before the ``execute`` tool (and therefore the backend) is ever
     invoked.
 
-    Also denies any tool call that isn't ``execute``, ``task``, or one of
-    the filesystem tools DeepAgents wires up by default — belt-and-braces
-    against a future middleware/tool addition this harness didn't
-    anticipate. In this POC's actual tool set (filesystem tools + execute +
-    task, see ``harness/agent.py``) this second check is a no-op; it exists
-    so that adding a new tool without updating this allowlist fails closed,
-    not open.
+    Also denies any tool call that isn't ``execute``, ``run_execution_plan``,
+    ``task``, or one of the filesystem tools DeepAgents wires up by default —
+    belt-and-braces against a future middleware/tool addition this harness
+    didn't anticipate. In this POC's actual tool set (filesystem tools +
+    execute + run_execution_plan + task, see ``harness/agent.py``) this
+    second check is a no-op; it exists so that adding a new tool without
+    updating this allowlist fails closed, not open.
+
+    ``run_execution_plan`` is treated as an ordinary known-safe tool here —
+    pre-existing bug fix, nothing mode-aware yet: it was previously reachable
+    by neither the ``execute`` branch nor ``_KNOWN_SAFE_TOOLS``, so every
+    call to it was denied outright, in every mode, unconditionally. Mode-
+    aware gating (hard-deny in read-only modes, pausing via ``interrupt_on``
+    in ``agent_auto``) is layered on top of this in a later change.
     """
 
     name = "ShellSandboxMiddleware"
 
     _KNOWN_SAFE_TOOLS = frozenset(
-        {"ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "task"}
+        {"ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "task", "run_execution_plan"}
     )
 
     def __init__(self, *, redact: str | None = None) -> None:
