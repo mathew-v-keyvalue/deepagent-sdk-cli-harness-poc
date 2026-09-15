@@ -144,6 +144,29 @@ def _extract_plan_outputs(tool_output: str | None) -> list[str]:
     return [entry["stdout"] for entry in payload.get("executionLog", []) if entry.get("stdout")]
 
 
+def _extract_plan_actions(tool_output: str | None) -> list[tuple[str, bool]]:
+    """Best-effort extraction of every step's real `command` and precomputed
+    `success` flag from a `run_execution_plan` call's JSON-encoded return
+    value — same `executionLog` shape `_extract_plan_outputs` above already
+    parses, and the same error-handling convention (a malformed/missing
+    payload contributes nothing rather than raising). Feeds `stream()`'s
+    `RecentAction` ring-buffer entries: one entry per step, since a single
+    `run_execution_plan` call can contain several independently
+    succeeding/failing steps.
+    """
+    if not tool_output:
+        return []
+    try:
+        payload = json.loads(tool_output)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [
+        (entry["command"], bool(entry.get("success")))
+        for entry in payload.get("executionLog", [])
+        if entry.get("command")
+    ]
+
+
 # One checkpointer for the life of this process, shared by every session —
 # this IS the state; server/sessions.py (like the Claude POC's) holds only
 # a session-id -> lock/metadata mapping, never message history. Process-
@@ -530,12 +553,29 @@ class ToolUseStarted:
 
 
 @dataclass
+class RecentAction:
+    """One real CLI-shaped action (`execute`/`run_execution_plan` step, not
+    DeepAgents-internal tool noise like `read_file`) and whether it
+    succeeded — accumulated per turn in `stream()`'s event loop, then
+    carried home on `Done` for `server/app.py` to fold into that session's
+    `SessionEntry.recent_actions` ring buffer. See `poc-wiki/
+    incremental-development/` for why: reporting "what already succeeded"
+    when a multi-step plan halts partway through.
+    """
+
+    action: str
+    success: bool
+    timestamp: float
+
+
+@dataclass
 class Done:
     session_id: str | None
     subtype: str | None
     total_cost_usd: float | None
     usage: dict[str, Any] | None
     num_turns: int | None
+    recent_actions: list[RecentAction]
 
 
 @dataclass
@@ -615,6 +655,7 @@ async def stream(
     tool_calls_seen: list[str] = []
     actual_commands_seen: list[str] = []
     actual_outputs_seen: list[str] = []
+    recent_actions: list[RecentAction] = []
     llm_tracker = _LlmCallTracker()
     final_text = ""
 
@@ -668,6 +709,61 @@ async def stream(
                                 actual_outputs_seen += _extract_plan_outputs(output_text)
                             else:
                                 actual_outputs_seen.append(output_text)
+                    elif kind == "on_chain_end" and event.get("name") == "tools":
+                        # The RecentAction signal source — deliberately NOT
+                        # on_tool_start/on_tool_end above. Confirmed live
+                        # (not assumed): when ShellSandboxMiddleware denies a
+                        # command, it short-circuits before the `execute`
+                        # tool's own traced Runnable ever runs, so
+                        # on_tool_start/on_tool_end/on_tool_error never fire
+                        # for a denied call at all — only this chain-level
+                        # "tools" node event does, for both denied AND
+                        # actually-executed calls alike. Its `data["input"]`
+                        # is the batch of requested tool_calls (with `id`);
+                        # `data["output"]["messages"]` is the resulting
+                        # ToolMessages, correlated by `tool_call_id`.
+                        chain_data = event.get("data") or {}
+                        requested = {
+                            tc["id"]: tc for tc in (chain_data.get("input") or []) if tc.get("id")
+                        }
+                        for tool_message in (chain_data.get("output") or {}).get("messages") or []:
+                            tool_call = requested.get(getattr(tool_message, "tool_call_id", None))
+                            if tool_call is None or tool_call.get("name") not in ("run_execution_plan", "execute"):
+                                continue
+                            if tool_call["name"] == "run_execution_plan":
+                                # One RecentAction per plan step, not one for
+                                # the whole call — a single result here can
+                                # represent several independently
+                                # succeeding/failing steps; collapsing to one
+                                # entry would lose exactly the "which steps
+                                # already succeeded" signal this exists for.
+                                plan_output = getattr(tool_message, "content", None)
+                                if isinstance(plan_output, str):
+                                    for command, success in _extract_plan_actions(plan_output):
+                                        recent_actions.append(RecentAction(command, success, time.time()))
+                                continue
+                            shell_command = (tool_call.get("args") or {}).get("command")
+                            if not isinstance(shell_command, str):
+                                continue
+                            match = _CYBERSIERRA_COMMAND_PATTERN.search(shell_command)
+                            if not match:
+                                continue
+                            if getattr(tool_message, "status", None) == "error":
+                                # Covers both a sandbox denial (this
+                                # ToolMessage never carries an `exit_code`
+                                # artifact at all, since the backend was
+                                # never reached) and a tool-level error
+                                # status for any other reason.
+                                success = False
+                            else:
+                                # A real, executed call: read the structured
+                                # {"exit_code": N} artifact (deepagents'
+                                # _execute_artifact) rather than text-sniffing
+                                # the human-readable output.
+                                artifact = getattr(tool_message, "artifact", None)
+                                exit_code = artifact.get("exit_code") if isinstance(artifact, dict) else None
+                                success = exit_code == 0
+                            recent_actions.append(RecentAction(" ".join(match.groups()), success, time.time()))
                     elif kind == "on_chat_model_end":
                         num_turns += 1
                         message = event["data"]["output"]
@@ -729,6 +825,7 @@ async def stream(
                     total_cost_usd=None,
                     usage=usage_totals or None,
                     num_turns=num_turns or None,
+                    recent_actions=recent_actions,
                 )
             except Exception as exc:  # noqa: BLE001 — mirrors the outer handler below
                 span.set_attribute("agent.status", "failed")

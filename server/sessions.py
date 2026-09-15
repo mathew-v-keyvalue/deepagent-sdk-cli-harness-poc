@@ -32,8 +32,17 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from uuid import uuid4
+
+from harness.agent import RecentAction
+
+# Bounds SessionEntry.recent_actions — a small, fixed-capacity ring buffer,
+# not a full history (that's the checkpointer's job). 20 is a reasonable,
+# easily-changed starting point: enough to cover a multi-step plan plus
+# some turn-to-turn history.
+RECENT_ACTIONS_MAXLEN = 20
 
 
 @dataclass
@@ -41,6 +50,16 @@ class SessionEntry:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     created_at: float = field(default_factory=time.monotonic)
     last_active_at: float = field(default_factory=time.monotonic)
+    # Recent real CLI-shaped actions this session took and whether each
+    # succeeded — survives across turns (unlike harness.agent.stream()'s
+    # own per-turn actual_commands_seen/actual_outputs_seen locals, which
+    # are discarded the instant a turn ends). Deliberately a derived
+    # convenience cache, not a new source of truth: the checkpointer's
+    # message history remains authoritative. See poc-wiki/
+    # incremental-development/ for why this exists.
+    recent_actions: deque[RecentAction] = field(
+        default_factory=lambda: deque(maxlen=RECENT_ACTIONS_MAXLEN)
+    )
 
 
 class SessionStore:

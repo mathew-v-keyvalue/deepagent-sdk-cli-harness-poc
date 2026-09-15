@@ -194,6 +194,7 @@ async def chat(
                     yield _sse("tool_use", {"name": event.name, "args": event.args or {}})
                 elif isinstance(event, Done):
                     store.touch(session_id)
+                    entry.recent_actions.extend(event.recent_actions)
                     yield _sse(
                         "done",
                         {
