@@ -749,7 +749,7 @@ directly against the installed packages, not docs prose:
 ```
 
 `harness/model.py:resolve_model()` reads this from `AGENT_MODEL` (default:
-Anthropic) — switching providers is an env var, not a code change, which is
+OpenAI, `openai:gpt-5.1`) — switching providers is an env var, not a code change, which is
 exactly the flexibility the sibling POC's own `CLAUDE_SDK_RECONSIDERATION.md`
 says Claude Agent SDK doesn't have ("Anthropic only. A LiteLLM multi-vendor
 request was closed 'not planned.'"). OpenAI was chosen as the alt-provider

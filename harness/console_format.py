@@ -117,7 +117,6 @@ def _build_cli_call_done(record: logging.LogRecord, tracker: "ConsoleStoryFilter
     exit_code = getattr(record, "exit_code", "?")
     duration_ms = getattr(record, "duration_ms", None)
     suffix = f" ({duration_ms}ms)" if duration_ms is not None else ""
-    tracker.last_cli_ok = exit_code == 0
     return f"{command} → exit {exit_code}{suffix}"
 
 
@@ -190,7 +189,6 @@ class ConsoleStoryFilter(logging.Filter):
     def __init__(self) -> None:
         super().__init__()
         self.counts = {"llm": 0, "cli": 0}
-        self.last_cli_ok = True
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:

@@ -37,32 +37,18 @@ Two checks:
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 import tempfile
 from pathlib import Path
 
 import httpx
 
-from _server_helper import TEST_SERVICE_AUTH, running_server
+from _server_helper import TEST_SERVICE_AUTH, _extract_text, running_server
 
 PORT_POSITIVE = 8102
 PORT_NEGATIVE = 8103
 PLACEHOLDER_TOKEN = "placeholder-token-not-real"
 REAL_BASE_URL = "https://morpheus-api.prod.cybersierra.ai/"
-
-
-def _extract_text(resp: httpx.Response) -> str:
-    text = ""
-    for line in resp.text.splitlines():
-        if line.startswith("data:"):
-            try:
-                payload = json.loads(line[len("data:") :].strip())
-            except json.JSONDecodeError:
-                continue
-            if "text" in payload:
-                text += payload["text"]
-    return text
 
 
 async def _ask_whoami(port: int, fresh_home: str, *, set_base_url: bool) -> str:

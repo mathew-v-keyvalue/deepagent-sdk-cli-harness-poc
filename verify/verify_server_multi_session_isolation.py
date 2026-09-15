@@ -44,7 +44,7 @@ import uuid
 
 import httpx
 
-from _server_helper import TEST_SERVICE_AUTH, running_server
+from _server_helper import TEST_SERVICE_AUTH, _extract_text, running_server
 
 PORT = 8100
 
@@ -100,19 +100,6 @@ async def check_two_sessions_distinct_env_tokens(client: httpx.AsyncClient, base
 
     print("PASS: two concurrent sessions each saw only their own access_token in MORPHEUS_TOKEN")
     return True
-
-
-def _extract_text(resp: httpx.Response) -> str:
-    text = ""
-    for line in resp.text.splitlines():
-        if line.startswith("data:"):
-            try:
-                payload = json.loads(line[len("data:") :].strip())
-            except json.JSONDecodeError:
-                continue
-            if "text" in payload:
-                text += payload["text"]
-    return text
 
 
 async def check_two_sessions_same_token_different_facts(client: httpx.AsyncClient, base_url: str) -> bool:

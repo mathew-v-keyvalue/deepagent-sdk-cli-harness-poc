@@ -8,6 +8,7 @@ into (event, data, timestamp) tuples.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import subprocess
 import sys
@@ -76,8 +77,6 @@ async def read_sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, 
     verify_server_streaming_incremental.py to prove deltas arrive spread
     out over real wall-clock time, not all at once.
     """
-    import json
-
     event_name = "message"
     data_lines: list[str] = []
 
@@ -91,3 +90,20 @@ async def read_sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, 
                 yield event_name, json.loads("".join(data_lines)), time.monotonic()
             event_name = "message"
             data_lines = []
+
+
+def _extract_text(resp: httpx.Response) -> str:
+    """Concatenate every `TextDelta`'s `text` field out of a non-streaming
+    SSE response body — shared by verify_server_fresh_deployment_no_profile.py
+    and verify_server_multi_session_isolation.py.
+    """
+    text = ""
+    for line in resp.text.splitlines():
+        if line.startswith("data:"):
+            try:
+                payload = json.loads(line[len("data:") :].strip())
+            except json.JSONDecodeError:
+                continue
+            if "text" in payload:
+                text += payload["text"]
+    return text

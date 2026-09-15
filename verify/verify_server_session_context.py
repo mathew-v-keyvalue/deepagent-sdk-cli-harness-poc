@@ -22,6 +22,7 @@ recalling "Ada" from a prior turn.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 
 import httpx
@@ -47,8 +48,6 @@ async def main() -> int:
             session_id = None
             for line in resp1.text.splitlines():
                 if line.startswith("data:") and '"session_id"' in line:
-                    import json
-
                     session_id = json.loads(line[len("data:") :].strip()).get("session_id")
                     break
             if not session_id:
@@ -71,8 +70,6 @@ async def main() -> int:
             full_text = ""
             for line in resp2.text.splitlines():
                 if line.startswith("data:"):
-                    import json
-
                     try:
                         payload = json.loads(line[len("data:") :].strip())
                     except json.JSONDecodeError:
