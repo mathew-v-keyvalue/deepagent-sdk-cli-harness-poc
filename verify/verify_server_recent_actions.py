@@ -27,15 +27,37 @@ both deliberate:
    the model's tool-call *decision* is scripted, not the mechanism being
    tested.
 
-Scenario: script the model to call `execute` with
+Two scenarios, run as two turns of the SAME session — so this also proves
+the "survives across turns" claim in `SessionEntry.recent_actions`' own
+docstring, not just that a single turn populates it:
+
+Turn 1 (`success=False`): script the model to call `execute` with
 `cybersierra auth set-token fake.jwt.token` verbatim. That command matches
 the 3-word `_CYBERSIERRA_COMMAND_PATTERN` shape (`auth`/`set-token`/`fake`)
 and is denied by harness/sandbox.py's `DENIED_COMMAND_PREFIXES` group-deny
 before any subprocess/network call — provable without a live cybersierra
 backend being reachable: exit_code must be `DENY_EXIT_CODE` (126), giving a
 deterministic `success=False` RecentAction regardless of environment.
-Proving the `success=True` path needs a real backend response and is NOT
-covered by this script — see the printed note at the end.
+
+Turn 2 (`success=True`): the counterpart branch — a command that is
+*allowed*, really runs as a subprocess, and exits 0, so the ToolMessage
+carries a real `{"exit_code": 0}` artifact and `stream()` records
+`success=True`. Deliberately NOT a real `cybersierra ...` call: that needs a
+reachable backend (`CYBERSIERRA_BASE_URL`), which is exactly what made this
+branch untestable before. Instead it uses `python3` — an
+`ALLOWED_COMMAND_PREFIXES` entry, same trick
+verify_server_multi_session_isolation.py already relies on — printing a
+cybersierra-shaped string, so `_CYBERSIERRA_COMMAND_PATTERN` (a `search`,
+not a `match`) still extracts an action from it.
+
+What turn 2 does and does not prove, stated plainly: it exercises the real
+middleware-allow path, the real `AllowlistedShellBackend.execute`
+subprocess, the real `exit_code == 0` artifact read in `stream()`'s
+`on_chain_end` branch, and the real `SessionEntry` population — end to end,
+no stubbing of the mechanism under test. It does NOT prove anything about
+how the real `cybersierra` CLI behaves against a live backend; the code
+under test only ever reads `artifact["exit_code"]`, and which binary
+produced that 0 is not something it can distinguish.
 """
 
 from __future__ import annotations
@@ -61,6 +83,14 @@ from server.sessions import store  # noqa: E402 — same in-process object /chat
 
 PLACEHOLDER_TOKEN = "placeholder-token-not-real"
 DENIED_COMMAND = "cybersierra auth set-token fake.jwt.token"
+DENIED_ACTION = "auth set-token fake"
+
+# Allowed (`python3` prefix), really runs, exits 0, and still carries a
+# 3-word cybersierra-shaped substring for _CYBERSIERRA_COMMAND_PATTERN's
+# `search` to extract — see the module docstring for why this stands in for
+# a real backend call.
+ALLOWED_COMMAND = "python3 -c \"print('cybersierra vendor risk list')\""
+ALLOWED_ACTION = "vendor risk list"
 
 
 class ScriptedToolCallModel(BaseChatModel):
@@ -86,62 +116,97 @@ class ScriptedToolCallModel(BaseChatModel):
         return "scripted"
 
 
-async def main() -> int:
-    fake_model = ScriptedToolCallModel(
+def _scripted_model(command: str) -> ScriptedToolCallModel:
+    """One `execute` call with `command`, then a plain final answer."""
+    return ScriptedToolCallModel(
         responses=[
-            AIMessage(content="", tool_calls=[{"name": "execute", "args": {"command": DENIED_COMMAND}, "id": "c1"}]),
+            AIMessage(content="", tool_calls=[{"name": "execute", "args": {"command": command}, "id": "c1"}]),
             AIMessage(content="done"),
         ]
     )
 
+
+async def _turn(client: httpx.AsyncClient, command: str, session_id: str | None) -> tuple[str | None, str]:
+    """Run one `/chat` turn whose model deterministically calls `execute`
+    with `command`. Returns `(session_id, raw_sse_text)`; `session_id` is
+    `None` if the turn failed or emitted no session event.
+    """
+    form = {"message": "run a command", "access_token": PLACEHOLDER_TOKEN}
+    if session_id is not None:
+        form["session_id"] = session_id
+    with patch("harness.agent.resolve_model", return_value=_scripted_model(command)):
+        resp = await client.post("/chat", data=form)
+    if resp.status_code != 200:
+        print(f"FAIL: turn returned {resp.status_code}: {resp.text}")
+        return None, resp.text
+    for line in resp.text.splitlines():
+        if line.startswith("data:") and '"session_id"' in line:
+            return json.loads(line[len("data:") :].strip()).get("session_id"), resp.text
+    # Only the first turn of a session emits a `session` event (see
+    # server/app.py's `is_new_session` branch), so a resumed turn legitimately
+    # has none — carry the caller's id through rather than calling it a failure.
+    return session_id, resp.text
+
+
+def _check(entry, action: str, expected_success: bool) -> bool:
+    matching = [a for a in entry.recent_actions if a.action == action]
+    if not matching:
+        print(f"FAIL: no recent_actions entry for {action!r}; got {list(entry.recent_actions)}")
+        return False
+    if matching[0].success is not expected_success:
+        print(f"FAIL: {action!r} RecentAction.success was not {expected_success}: {matching[0]!r}")
+        return False
+    print(f"  ok: {action!r} recorded with success={expected_success}: {matching[0]!r}")
+    return True
+
+
+async def main() -> int:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
         transport=transport, base_url="http://test", timeout=60.0, headers={"X-Service-Auth": TEST_SERVICE_AUTH}
     ) as client:
-        with patch("harness.agent.resolve_model", return_value=fake_model):
-            resp = await client.post(
-                "/chat",
-                data={"message": "run a command", "access_token": PLACEHOLDER_TOKEN},
-            )
-        if resp.status_code != 200:
-            print(f"FAIL: turn returned {resp.status_code}: {resp.text}")
-            return 1
-
-        session_id = None
-        for line in resp.text.splitlines():
-            if line.startswith("data:") and '"session_id"' in line:
-                session_id = json.loads(line[len("data:") :].strip()).get("session_id")
-                break
+        # Turn 1 — denied command, success=False.
+        session_id, raw = await _turn(client, DENIED_COMMAND, None)
         if not session_id:
-            print(f"FAIL: no session event in response:\n{resp.text[:2000]}")
+            print(f"FAIL: no session event in response:\n{raw[:2000]}")
             return 1
-        print(f"turn ok, session_id={session_id}")
+        print(f"turn 1 (denied) ok, session_id={session_id}")
 
         entry = store.get(session_id)
         if entry is None:
-            print("FAIL: no SessionEntry found for session_id after the turn")
+            print("FAIL: no SessionEntry found for session_id after turn 1")
             return 1
-
         if not entry.recent_actions:
-            print(f"FAIL: SessionEntry.recent_actions is empty after a turn that ran a tracked command\n{resp.text[:2000]}")
+            print(f"FAIL: SessionEntry.recent_actions is empty after turn 1\n{raw[:2000]}")
+            return 1
+        print(f"recent_actions after turn 1: {list(entry.recent_actions)}")
+        if not _check(entry, DENIED_ACTION, False):
             return 1
 
-        print(f"recent_actions: {list(entry.recent_actions)}")
+        # Turn 2 — same session, allowed command that really runs and exits 0.
+        resumed_id, raw = await _turn(client, ALLOWED_COMMAND, session_id)
+        if resumed_id is None:
+            return 1
+        print(f"turn 2 (allowed, exit 0) ok, session_id={resumed_id}")
 
-        matching = [a for a in entry.recent_actions if a.action == "auth set-token fake"]
-        if not matching:
-            print(f"FAIL: no recent_actions entry for the expected denied command; got {list(entry.recent_actions)}")
+        entry = store.get(session_id)
+        if entry is None:
+            print("FAIL: SessionEntry disappeared between turns")
+            return 1
+        print(f"recent_actions after turn 2: {list(entry.recent_actions)}")
+
+        # Both must be present: turn 2's success=True (the branch that had no
+        # live coverage at all before) AND turn 1's entry still there, which is
+        # the cross-turn survival the ring buffer exists for.
+        if not _check(entry, ALLOWED_ACTION, True):
+            return 1
+        if not _check(entry, DENIED_ACTION, False):
+            print("       ^ turn 1's action did not survive into turn 2 — the ring buffer is not persisting across turns")
             return 1
 
-        if matching[0].success is not False:
-            print(f"FAIL: denied command's RecentAction.success was not False: {matching[0]!r}")
-            return 1
-
-        print(f"PASS: SessionEntry.recent_actions recorded the denied action with success=False: {matching[0]!r}")
         print(
-            "NOTE: success=True is not exercised by this script — that needs a real "
-            "cybersierra backend response (CYBERSIERRA_BASE_URL reachable), which is "
-            "a separate, not-yet-covered case."
+            "PASS: both RecentAction branches recorded (denied -> success=False, "
+            "real exit 0 -> success=True), and turn 1's action survived into turn 2."
         )
         return 0
 

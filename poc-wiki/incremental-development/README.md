@@ -7,8 +7,6 @@ record (decisions, open questions) — this folder is the build-order log of
 what actually landed, change by change, so anyone picking this up later can
 see the path taken without replaying the whole session history.
 
-Empty for now — first entry lands with the first real change.
-
 Suggested shape per entry (one file per change, e.g.
 `0001-<short-slug>.md`), not yet enforced:
 

@@ -1,7 +1,7 @@
 # 0002 — Ring buffer of recent agent actions
 
-Status: **implemented**, verified live, ready to commit. Full design plan:
-`/home/mathewvkariath/.claude/plans/start-with-2-on-fuzzy-quill.md`.
+Status: **implemented**, verified live, committed (`2a44665`). Full design
+plan: `/home/mathewvkariath/.claude/plans/start-with-2-on-fuzzy-quill.md`.
 
 ## What changed
 
@@ -85,14 +85,35 @@ than ship speculative code with no currently-observable effect.
   unreachable) local backend — correctly produced `success=False` via the
   `artifact.get("exit_code")` path, not the `status == "error"` path.
 
+## Follow-up: the disclosed `success=True` gap is now closed
+
+The original writeup disclosed that `success=True` had never been exercised
+live, on the reasoning that it needed a reachable `cybersierra` backend
+(`CYBERSIERRA_BASE_URL=http://localhost:8080`, not running here). That
+premise was too narrow. The code under test only ever reads
+`artifact["exit_code"]` — it cannot tell which binary produced the `0`. And
+`_CYBERSIERRA_COMMAND_PATTERN` is a `search`, not a `match`, so the
+cybersierra-shaped substring it extracts need not be the command itself.
+
+So `verify/verify_server_recent_actions.py` gained a second turn using
+`python3` (already an `ALLOWED_COMMAND_PREFIXES` entry, and already used
+this way by `verify_server_multi_session_isolation.py`) printing a
+cybersierra-shaped string: allowed by both enforcement layers, really run as
+a subprocess, exits 0, produces a real `{"exit_code": 0}` artifact. **PASSES
+live** — `RecentAction(action='vendor risk list', success=True, ...)`.
+Nothing in the mechanism under test is stubbed; only the model's tool-call
+decision is, as before. What it still does not prove: anything about the
+real `cybersierra` CLI's behavior against a live backend — but that was
+never what this code path does.
+
+The same change made the two turns share one `session_id`, which closed a
+second, previously unnoticed gap: `SessionEntry.recent_actions`' whole
+reason for existing is surviving across turns, and the original script only
+ever ran one turn. Turn 1's denied action is now asserted to still be
+present after turn 2. Also **PASSES**.
+
 ## Not verified (known gap, disclosed rather than assumed)
 
-- `success=True` was not exercised live — needs a real `cybersierra`
-  backend response, and the local one (`CYBERSIERRA_BASE_URL=http://
-  localhost:8080`) isn't running in this environment. The code path reading
-  `artifact["exit_code"] == 0` is the same code already proven correct for
-  the `!= 0` case, so this is a low-risk gap, but it is a gap, not a
-  verified pass.
 - `run_execution_plan`'s per-step extraction (`_extract_plan_actions`) was
   unit-tested directly but not exercised through a live turn — per existing
   comments in `harness/agent.py`, the model calls `execute` directly in
@@ -100,8 +121,9 @@ than ship speculative code with no currently-observable effect.
 
 ## Impact
 
-`SessionEntry.recent_actions` now exists and is populated correctly for
-both the success and (both kinds of) failure case that could be tested live.
+`SessionEntry.recent_actions` now exists and is populated correctly —
+verified live for the success case, both kinds of failure case, and
+survival across turns.
 Not exposed over the SSE contract or any endpoint yet — deliberately
 deferred, per the approved plan. TTL eviction, chat summarization, and the
 Postgres write-behind flush remain separate, unstarted backlog items.
