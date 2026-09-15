@@ -49,7 +49,14 @@ Checks, in order:
    unsafe-plan attempt still pauses (unlock was never granted).
 6. Skill-write always-asks, independent of `write_unlocked`: even in an
    already-unlocked `agent_auto` session, a skill-write still pauses.
-7. Ad-hoc `execute` gating -- added after this was confirmed LIVE (2026-09-14,
+7. `agent_plan` skill-write approve round trip -- added after this was
+   confirmed LIVE (2026-09-14, real server) to be a real bug: check 2 only
+   confirmed the pause, never the approval. Approving it used to be
+   silently denied anyway by `ShellSandboxMiddleware`'s unconditional
+   read-only-mode hard-deny (no carve-out for an already-approved
+   skill-write) -- an approved plan-mode skill-write did nothing. Drives
+   pause -> approve -> real file write, and cleans up after itself.
+8. Ad-hoc `execute` gating -- added after this was confirmed LIVE (2026-09-14,
    real server, real tenant) to be a real bypass, not a hypothetical one: the
    model routinely writes via `execute` instead of `run_execution_plan`, and
    before this check existed nothing gated it. Confirms an ad-hoc write-shaped
@@ -62,6 +69,7 @@ Checks, in order:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import tempfile
@@ -358,6 +366,56 @@ async def check_skill_write_always_asks_even_when_unlocked() -> bool:
     return True
 
 
+async def check_agent_plan_skill_write_approve_round_trip() -> bool:
+    """Regression test for a real bug confirmed LIVE (2026-09-14, real
+    server): `check_hard_deny_ask_and_plan` only confirmed the skill-write
+    *pauses* in `agent_plan` -- it never approved it. Doing so live showed
+    the approved write was then silently denied by `ShellSandboxMiddleware`
+    (still unconditionally hard-denying every write-shaped fs call in
+    `agent_plan`, with no carve-out for a skill-write that had already been
+    approved via `interrupt_on`) -- an approved plan-mode skill-write did
+    nothing at all. This check drives the full pause -> approve -> real
+    write round trip, and cleans up the file it creates.
+    """
+    from harness import agent as agent_module
+    from harness.agent import PROJECT_ROOT
+
+    abs_path = PROJECT_ROOT / "skills/_generated/verify-mode-gates-tmp/SKILL.md"
+    # A real absolute path, not a project-relative one: the backend runs
+    # with virtual_mode=False (see harness/agent.py's _build_agent), so a
+    # relative path resolves against the OS root, not PROJECT_ROOT -- and
+    # every real model call observed live always sends the full absolute
+    # path anyway (it only ever sees absolute paths via ls/read_file).
+    skill_write_args = {"file_path": str(abs_path), "content": "# verify_mode_gates.py temp skill\n"}
+    session_id = "agent-plan-skillwrite-roundtrip"
+    try:
+        events1, _ = await _stream_all(
+            "agent_plan", [_tool_call("write_file", skill_write_args)], prompt="learn a skill", session_id=session_id
+        )
+        if not any(isinstance(e, agent_module.AwaitingApproval) for e in events1):
+            print("FAIL (agent_plan skill-write round trip): setup pause didn't happen")
+            return False
+
+        events2, _ = await _stream_all(
+            "agent_plan", [], resume=session_id, write_unlocked=False, decision={"type": "approve"}
+        )
+        finished = [
+            e for e in events2 if isinstance(e, agent_module.ToolUseFinished) and e.name == "write_file"
+        ]
+        if not finished or not finished[0].success:
+            print(f"FAIL (agent_plan skill-write round trip): approved write_file did not report success: {finished!r}")
+            return False
+        if not abs_path.is_file():
+            print(f"FAIL (agent_plan skill-write round trip): approved write_file reported success but {abs_path} was never created")
+            return False
+        print("PASS (agent_plan skill-write round trip): approving a plan-mode skill-write actually writes the file")
+        return True
+    finally:
+        abs_path.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            abs_path.parent.rmdir()
+
+
 async def check_execute_command_gating() -> bool:
     """Regression test for the live-confirmed gap: the model routinely
     writes via ad-hoc `execute` instead of `run_execution_plan`, and before
@@ -440,6 +498,7 @@ def main() -> int:
         check_approve_then_unlock,
         check_reject_then_repause,
         check_skill_write_always_asks_even_when_unlocked,
+        check_agent_plan_skill_write_approve_round_trip,
         check_execute_command_gating,
     ]
     results = [asyncio.run(check()) for check in checks]

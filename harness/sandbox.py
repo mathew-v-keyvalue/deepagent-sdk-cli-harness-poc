@@ -423,12 +423,14 @@ class ShellSandboxMiddleware(AgentMiddleware):
     a separate, independent mechanism from ``agent_auto``'s one-time
     ``interrupt_on`` pause (``harness/agent.py``): this layer either denies
     a call outright or lets it through unchanged; it never pauses one
-    itself. One case is transitional here: a write targeting
-    ``skills/_generated/`` (the model persisting a self-extension skill) is
-    hard-denied in ``agent_plan`` the same as any other write for now — its
-    approval exception is wired in a later change, once ``interrupt_on`` is
-    available to that mode too (see ``poc-wiki/execution-modes/
-    decisions-log.md``'s "Filesystem writes / skill self-extension" section).
+    itself. One exception: a write targeting ``skills/_generated/`` (the
+    model persisting a self-extension skill) is registered in
+    ``agent_plan``'s ``interrupt_on`` too (see
+    ``harness/agent.py``'s ``_build_interrupt_on``), so it never reaches
+    this middleware's hard-deny in the first place until it's already been
+    approved — this layer lets that one case through even in
+    ``READ_ONLY_MODES`` (see ``poc-wiki/execution-modes/decisions-log.md``'s
+    "Filesystem writes / skill self-extension" section).
     """
 
     name = "ShellSandboxMiddleware"
@@ -564,13 +566,19 @@ class ShellSandboxMiddleware(AgentMiddleware):
             return None
 
         if name in self._WRITE_SHAPED_FS_TOOLS:
-            if self._mode in READ_ONLY_MODES:
-                is_skill_write = self._is_skill_write(name, args)
-                # Transitional: agent_plan hard-denies a skill-write here too,
-                # same as any other write, until interrupt_on is wired for
-                # this mode (see class docstring) -- is_skill_write is
-                # already logged now so the distinction is visible ahead of
-                # that change, even though the decision doesn't differ yet.
+            is_skill_write = self._is_skill_write(name, args)
+            if self._mode in READ_ONLY_MODES and not (self._mode == "agent_plan" and is_skill_write):
+                # agent_plan's skill-write exception: a skill-write in this
+                # mode is registered in interrupt_on (see
+                # harness/agent.py's _build_interrupt_on), so this middleware
+                # only ever sees one of two cases -- an ordinary write
+                # (never reaches interrupt_on, denied here unconditionally,
+                # same as `ask`) or a skill-write that already paused for
+                # approval and is now resuming after an "approve" decision
+                # (interrupt_on would never have let a "reject" reach this
+                # point at all). Denying it here too would make an approved
+                # agent_plan skill-write silently no-op -- confirmed live as
+                # a real bug before this fix (see git history).
                 logger.warning(
                     "tool_call_denied name=%r mode=%r is_skill_write=%s (filesystem write unavailable in read-only mode)",
                     name,
