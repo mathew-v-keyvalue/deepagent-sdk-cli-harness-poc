@@ -197,9 +197,13 @@ async def chat(
         try:
             if is_new_session:
                 yield _sse("session", {"session_id": session_id})
-                harness_events = stream(message, access_token, session_id=session_id)
+                harness_events = stream(
+                    message, access_token, session_id=session_id, user_permissions=entry.user_permissions
+                )
             else:
-                harness_events = stream(message, access_token, resume=session_id)
+                harness_events = stream(
+                    message, access_token, resume=session_id, user_permissions=entry.user_permissions
+                )
 
             async for event in harness_events:
                 if isinstance(event, TextDelta):

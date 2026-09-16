@@ -90,6 +90,21 @@ logger.addHandler(logging.NullHandler())
 # outcome. This is a harness-level override, not a skill edit, since the
 # skill text prescribing it is a verbatim port reused outside this project.
 #
+# A fifth addition (2026-09-16): when a manifest operation carries a
+# requiredPermission field, compare it against this session's permission
+# grants (rendered separately, see _render_user_permissions below) and flag
+# a step that will fail on permission grounds before running anything,
+# rather than discovering it mid-plan. See poc-wiki/incremental-
+# development/0004-plan-time-permission-checking.md and 0005-cli-manifest-
+# extension-proposal.md — this is "Case 1" from that design.
+#
+# A sixth addition, same date: react to a plan step failing with exit code
+# 4 (forbidden) by naming what already succeeded and what's actually
+# missing, instead of a generic error — the fallback for every command not
+# yet covered by the fifth addition above ("Case 2" in the same docs), and
+# the only behavior that fires today, since the manifest annotation this
+# depends on is a separate, not-yet-landed change in morpheus_backend.
+#
 # The instruction text itself lives in prompts/system_prompt_appendix.md
 # (plain text, one paragraph per blank-line-separated block, loaded verbatim
 # below) so it can be edited without touching this module — the rationale
@@ -99,6 +114,20 @@ logger.addHandler(logging.NullHandler())
 SYSTEM_PROMPT_APPENDIX = (
     Path(__file__).resolve().parent / "prompts" / "system_prompt_appendix.md"
 ).read_text().strip()
+
+
+def _render_user_permissions(user_permissions: dict[str, list[str]] | None) -> str:
+    """Renders this session's resolved permission grants (poc-wiki/
+    incremental-development/0003-user-permission-contract-design.md) into
+    the plain text the system prompt's fifth addition above tells the
+    model to compare a manifest operation's requiredPermission against.
+    Empty string when absent, so the prompt doesn't grow for callers that
+    never send this (e.g. the verify/*.py scripts).
+    """
+    if not user_permissions:
+        return ""
+    lines = [f"- {resource}: {', '.join(actions)}" for resource, actions in sorted(user_permissions.items())]
+    return "\n\nThis session's permission grants (resource: allowed actions):\n" + "\n".join(lines)
 
 # Mirrors eval/local/scoring.py's `_CYBERSIERRA_COMMAND_PATTERN` — catches a
 # model bypassing `run_execution_plan` and invoking `cybersierra <module>
@@ -236,7 +265,12 @@ _INJECT_ENV_VAR = "CYBERSIERRA_INJECT_ACCESS_TOKEN"
 GRAPH_RECURSION_LIMIT = 500
 
 
-def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None = None):
+def _build_agent(
+    access_token: str = "",
+    *,
+    checkpointer: InMemorySaver | None = None,
+    user_permissions: dict[str, list[str]] | None = None,
+):
     """The one place that assembles this harness's DeepAgents graph.
 
     Called fresh on every `run()`/`stream()` call, exactly like the Claude
@@ -353,7 +387,7 @@ def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None =
 
     return create_deep_agent(
         model=resolve_model(),
-        system_prompt=SYSTEM_PROMPT_APPENDIX,
+        system_prompt=SYSTEM_PROMPT_APPENDIX + _render_user_permissions(user_permissions),
         tools=[make_run_execution_plan_tool(backend)],
         middleware=[ShellSandboxMiddleware(redact=access_token)],
         skills=[str(SKILLS_ROOT)],
@@ -612,6 +646,7 @@ async def stream(
     *,
     session_id: str | None = None,
     resume: str | None = None,
+    user_permissions: dict[str, list[str]] | None = None,
 ) -> AsyncIterator[HarnessEvent]:
     """Run one turn, yielding incremental events as they arrive.
 
@@ -660,7 +695,7 @@ async def stream(
     final_text = ""
 
     try:
-        graph = _build_agent(access_token)
+        graph = _build_agent(access_token, user_permissions=user_permissions)
 
         with Netra.start_span("Agent_Turn", as_type=SpanType.TOOL, module_name="agent") as span:
             span.set_attribute("agent.thread_id", thread_id)
