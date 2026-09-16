@@ -60,6 +60,16 @@ class SessionEntry:
     recent_actions: deque[RecentAction] = field(
         default_factory=lambda: deque(maxlen=RECENT_ACTIONS_MAXLEN)
     )
+    # Advisory-only permission grants resolved server-side by
+    # morpheus_backend's Casbin integration (poc-wiki/incremental-
+    # development/0003-user-permission-contract-design.md) — resource ->
+    # deduped action-name list, e.g. {"assessment": ["CREATE", "VIEW"]}.
+    # Never used to block/gate anything; refreshed on every /chat call that
+    # includes it, not just session creation (matches the backend's own
+    # cadence decision — its Redis cache already bounds staleness, no
+    # second staleness window needed here). None until the first call that
+    # sends it.
+    user_permissions: dict[str, list[str]] | None = None
 
 
 class SessionStore:

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -59,6 +60,8 @@ from harness.agent import Done, Failed, TextDelta, ToolUseStarted, stream
 from harness.observability import configure_logging
 from harness.tracing import init_tracing
 from server.sessions import store
+
+logger = logging.getLogger("server.app")
 
 load_dotenv(override=False)
 configure_logging()  # see harness/observability.py — this is what makes
@@ -144,6 +147,12 @@ async def chat(
     # with; harness.agent treats an empty access_token as "no per-request
     # identity," not as an error.
     access_token: str = Form(""),
+    # Advisory-only permission grants resolved server-side by
+    # morpheus_backend's Casbin integration (poc-wiki/incremental-
+    # development/0003-user-permission-contract-design.md). JSON-encoded
+    # {resource: [action, ...]}. Optional so this endpoint keeps working
+    # for any caller that doesn't send it (e.g. the verify/* scripts).
+    permissions: str | None = Form(None),
 ):
     is_new_session = session_id is None
     if is_new_session:
@@ -179,6 +188,11 @@ async def chat(
     async def event_source() -> AsyncIterator[str]:
         entry = store.get(session_id)
         assert entry is not None  # just created or looked up above
+        if permissions:
+            try:
+                entry.user_permissions = json.loads(permissions)
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse `permissions` form field as JSON; ignoring it for this turn")
         await entry.lock.acquire()
         try:
             if is_new_session:
