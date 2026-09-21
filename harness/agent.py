@@ -21,6 +21,7 @@ doesn't.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -29,13 +30,14 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from deepagents import create_deep_agent
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
 from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
+from pydantic import BaseModel
 
 from harness.executor_tool import make_run_execution_plan_tool
 from harness.model import resolve_model
@@ -244,6 +246,57 @@ class _BoundedContextMiddleware(AgentMiddleware):
         existing_system_text = request.system_message.content if request.system_message else ""
         new_system = SystemMessage(content=f"{existing_system_text}{_render_chat_summary(summary)}")
         return await handler(request.override(messages=window_messages, system_message=new_system))
+
+
+# Message intent classification (poc-wiki/incremental-development/): the
+# shape of a request, not its specific CLI resource -- this system
+# deliberately has no hardcoded resource/module vocabulary (everything is
+# discovered live via `cybersierra manifest --raw`, see skills/cyber-sierra/
+# _internal/planner/references/planning-rules.md's "No hardcoded CLI
+# knowledge"), so a resource-tagged taxonomy would need constant upkeep
+# against a manifest that's intentionally never enumerated here. Not
+# consumed/routed on anywhere yet -- same "build the field before its
+# consumer exists" precedent as RecentAction, which also isn't exposed over
+# any endpoint yet.
+MessageIntentLabel = Literal[
+    "read_query",
+    "write_action",
+    "workflow_request",
+    "capability_question",
+    "clarification_or_followup",
+    "conversational",
+    "report_request",
+]
+
+
+class _IntentClassification(BaseModel):
+    intent: MessageIntentLabel
+
+
+async def _classify_message_intent(prompt: str) -> MessageIntentLabel | None:
+    """One cheap LLM call, constrained to exactly one of the labels above by
+    with_structured_output() -- enforced by the provider's own
+    structured-output machinery, not just asked for in the prompt text.
+    Returns None on any failure; never raises. Callers must run this as a
+    background task and must not let its failure touch the main turn --
+    same advisory-degrade posture as _update_chat_summary above."""
+    try:
+        model = resolve_model().with_structured_output(_IntentClassification)
+        result = await model.ainvoke(
+            [
+                HumanMessage(
+                    content=(
+                        "Classify the shape of this user message for a compliance/GRC "
+                        "assistant. Pick exactly one category.\n\n"
+                        f"Message: {prompt}"
+                    )
+                )
+            ]
+        )
+        return result.intent
+    except Exception:
+        logger.warning("message intent classification failed", exc_info=True)
+        return None
 
 
 # Mirrors eval/local/scoring.py's `_CYBERSIERRA_COMMAND_PATTERN` — catches a
@@ -758,6 +811,9 @@ class Done:
     # a stale/duplicate value.
     chat_summary: str | None = None
     chat_summary_covers_turns: int | None = None
+    # None when classification failed/timed out -- not a valid label, the
+    # caller should treat this turn as unclassified, not retry or guess.
+    intent: MessageIntentLabel | None = None
 
 
 @dataclass
@@ -819,6 +875,12 @@ async def stream(
     thread_id = session_id or resume
     if not thread_id:
         raise ValueError("exactly one of session_id or resume is required")
+
+    # Fired as early as possible so it runs *concurrently* with everything
+    # below (the graph run is typically many seconds; this is one small
+    # LLM call) -- awaited, with a timeout, only once we're already
+    # assembling Done. Never blocks turn start, never blocks the response.
+    intent_task = asyncio.create_task(_classify_message_intent(prompt))
 
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": GRAPH_RECURSION_LIMIT}
 
@@ -965,13 +1027,24 @@ async def stream(
                 # skills_metadata until the graph has actually executed once).
                 await _log_skills_available(graph, config, access_token)
 
+                # By now the graph has already run for however many seconds
+                # that took -- classification (one small LLM call, started
+                # at turn start) has almost always already finished. The
+                # timeout is a backstop, not the expected path.
+                try:
+                    intent = await asyncio.wait_for(intent_task, timeout=5.0)
+                except Exception:
+                    logger.warning("message intent classification timed out or failed", exc_info=True)
+                    intent = None
+
                 logger.info(
-                    "turn_done thread_id=%s num_turns=%d tool_calls=%r usage=%r actual_commands=%r",
+                    "turn_done thread_id=%s num_turns=%d tool_calls=%r usage=%r actual_commands=%r intent=%s",
                     thread_id,
                     num_turns,
                     tool_calls_seen,
                     usage_totals,
                     actual_commands_seen,
+                    intent,
                     extra={
                         "event": "turn_done",
                         "thread_id": thread_id,
@@ -979,6 +1052,7 @@ async def stream(
                         "tool_calls": tool_calls_seen,
                         "usage": usage_totals,
                         "actual_commands": actual_commands_seen,
+                        "intent": intent,
                     },
                 )
                 span.set_attribute("agent.num_turns", str(num_turns))
@@ -1014,12 +1088,18 @@ async def stream(
                     recent_actions=recent_actions,
                     chat_summary=chat_summary_result.summary if chat_summary_result.changed else None,
                     chat_summary_covers_turns=chat_summary_result.covers_turns if chat_summary_result.changed else None,
+                    intent=intent,
                 )
             except Exception as exc:  # noqa: BLE001 — mirrors the outer handler below
                 span.set_attribute("agent.status", "failed")
                 span.set_error(str(exc))
                 raise
     except Exception as exc:  # noqa: BLE001 — deliberately broad, see Claude POC's ClaudeSDKError handling
+        # Explicit cancel, not left to GC: an asyncio.Task nothing ever
+        # awaits/cancels can log an "exception was never retrieved" warning
+        # if it also failed -- the turn already failed here regardless of
+        # what classification was doing, so its result is moot either way.
+        intent_task.cancel()
         logger.exception("harness_error thread_id=%s", thread_id, extra={"event": "harness_error", "thread_id": thread_id})
         yield Failed("harness_error", str(exc))
 

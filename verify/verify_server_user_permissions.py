@@ -76,6 +76,14 @@ class ScriptedToolCallModel(BaseChatModel):
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        # See verify_checkpoint_backup_restore.py's identical comment:
+        # harness.agent._classify_message_intent's incidental, concurrent
+        # resolve_model() call is recognized and short-circuited here
+        # without touching self._i, so it can never consume a slot meant
+        # for a specific step in the real sequence below.
+        last_text = getattr(messages[-1], "content", "") if messages else ""
+        if isinstance(last_text, str) and "Classify the shape of this user message" in last_text:
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="conversational"))])
         msg = self.responses[self._i]
         self._i += 1
         return ChatResult(generations=[ChatGeneration(message=msg)])

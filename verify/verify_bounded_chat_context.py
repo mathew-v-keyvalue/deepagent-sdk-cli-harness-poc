@@ -78,6 +78,15 @@ class RouterModel(BaseChatModel):
             mentioned_turns = re.findall(r"turn \d+", last_text)
             reply = "Summary so far: " + "; ".join(dict.fromkeys(mentioned_turns))
             return ChatResult(generations=[ChatGeneration(message=AIMessage(content=reply))])
+        if isinstance(last_text, str) and "Classify the shape of this user message" in last_text:
+            # harness.agent._classify_message_intent's incidental
+            # resolve_model() call -- not a main-turn call, must not land in
+            # main_call_messages (that would silently corrupt the "latest
+            # main call" assertions below with an unrelated message list).
+            # A generic reply is enough since with_structured_output()'s
+            # parsing will fail against this custom double anyway --
+            # degrades to intent=None, already exercised as a no-op path.
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="conversational"))])
         main_call_messages.append(list(messages))
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ack"))])
 

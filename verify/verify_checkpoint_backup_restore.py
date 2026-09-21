@@ -67,6 +67,17 @@ class ScriptedToolCallModel(BaseChatModel):
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        # harness.agent._classify_message_intent also calls resolve_model()
+        # (mocked to this same instance) as an incidental background call,
+        # running *concurrently* with the main turn -- asyncio scheduling
+        # doesn't guarantee it lands before/after/between the real,
+        # intentionally-sequenced calls below, so merely clamping the index
+        # isn't safe (it could still consume a slot meant for a specific
+        # step). Recognized and short-circuited without touching self._i at
+        # all, so the real sequence is untouched regardless of timing.
+        last_text = getattr(messages[-1], "content", "") if messages else ""
+        if isinstance(last_text, str) and "Classify the shape of this user message" in last_text:
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="conversational"))])
         msg = self.responses[self._i]
         self._i += 1
         return ChatResult(generations=[ChatGeneration(message=msg)])

@@ -47,6 +47,7 @@ import hmac
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -64,7 +65,7 @@ import harness.agent as agent_module
 from harness.agent import Done, Failed, TextDelta, ToolUseStarted, stream
 from harness.observability import configure_logging
 from harness.tracing import init_tracing
-from server.sessions import store
+from server.sessions import MessageIntent, store
 
 logger = logging.getLogger("server.app")
 
@@ -278,6 +279,10 @@ async def chat(
                     if event.chat_summary is not None:
                         entry.chat_summary = event.chat_summary
                         entry.chat_summary_covers_turns = event.chat_summary_covers_turns
+                    # None means classification failed/timed out this turn --
+                    # just don't append, not backfilled or retried.
+                    if event.intent is not None:
+                        entry.recent_intents.append(MessageIntent(event.intent, message[:200], time.time()))
                     yield _sse(
                         "done",
                         {

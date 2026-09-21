@@ -36,13 +36,20 @@ from collections import deque
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from harness.agent import RecentAction
+from harness.agent import MessageIntentLabel, RecentAction
 
 # Bounds SessionEntry.recent_actions — a small, fixed-capacity ring buffer,
 # not a full history (that's the checkpointer's job). 20 is a reasonable,
 # easily-changed starting point: enough to cover a multi-step plan plus
 # some turn-to-turn history.
 RECENT_ACTIONS_MAXLEN = 20
+
+
+@dataclass
+class MessageIntent:
+    intent: MessageIntentLabel
+    message_preview: str
+    timestamp: float
 
 
 @dataclass
@@ -78,6 +85,14 @@ class SessionEntry:
     # Both empty/0 until a session's history actually exceeds the window.
     chat_summary: str = ""
     chat_summary_covers_turns: int = 0
+    # Same bounded-ring-buffer shape/cap as recent_actions -- classification
+    # is best-effort (see harness.agent._classify_message_intent), so a turn
+    # with no successful classification just doesn't append here, it's not
+    # backfilled or retried. Not read/routed on by anything yet -- see
+    # poc-wiki/incremental-development/.
+    recent_intents: deque[MessageIntent] = field(
+        default_factory=lambda: deque(maxlen=RECENT_ACTIONS_MAXLEN)
+    )
 
 
 class SessionStore:
