@@ -48,6 +48,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -55,7 +56,11 @@ from fastapi import Depends, FastAPI, Form, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
+import harness.agent as agent_module
 from harness.agent import Done, Failed, TextDelta, ToolUseStarted, stream
 from harness.observability import configure_logging
 from harness.tracing import init_tracing
@@ -71,7 +76,50 @@ configure_logging()  # see harness/observability.py — this is what makes
 init_tracing()  # see harness/tracing.py — no-op unless NETRA_TRACING and
 # NETRA_API_KEY are both set; enables the cli_call/Plan_Step/Agent_Turn spans.
 
-app = FastAPI(title="cybersierra chat server (DeepAgents POC)")
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Swaps the harness's checkpointer (harness/agent.py's `_checkpointer`,
+    the graph's actual live checkpointer — see poc-wiki/incremental-
+    development/ for why this is a straight swap, not a hot in-memory layer
+    plus a separately-synced backup) for a Postgres-backed one, for this
+    process's lifetime. A no-op, deliberately, when DATABASE_URL isn't set:
+    this harness then runs exactly as it always has, in-memory only, lost
+    on restart.
+    """
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        logger.warning("DATABASE_URL not set — sessions are in-memory only and won't survive a restart")
+        yield
+        return
+
+    # AsyncPostgresSaver.from_conn_string() opens exactly one raw connection,
+    # not a pool — confirmed by reading its source, not assumed from having
+    # `psycopg[pool]` installed. Every concurrent request would've serialized
+    # through that single connection, and a dropped connection would have
+    # broken the checkpointer for the rest of this process's life with no
+    # automatic recovery. Building the pool explicitly instead; `kwargs`
+    # replicates the exact connection settings that source requires
+    # (autocommit/prepare_threshold/row_factory) so pooled connections behave
+    # identically to what AsyncPostgresSaver expects — confirmed live.
+    pool = AsyncConnectionPool(
+        conninfo=database_url,
+        kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+        open=False,
+        min_size=1,
+        max_size=10,
+    )
+    await pool.open()
+    try:
+        checkpointer = AsyncPostgresSaver(conn=pool)
+        await checkpointer.setup()  # idempotent — creates its own tables/tracks its own version if absent
+        agent_module.set_checkpointer(checkpointer)
+        logger.info("Postgres-backed checkpointer connected (pooled, min_size=1 max_size=10)")
+        yield
+    finally:
+        await pool.close()
+
+
+app = FastAPI(title="cybersierra chat server (DeepAgents POC)", lifespan=lifespan)
 
 # Any direct browser caller needs CORS to reach /chat and /health from JS
 # `fetch`. As of the morpheus_backend integration, morpheus_fe's "AI Chat"
@@ -198,11 +246,21 @@ async def chat(
             if is_new_session:
                 yield _sse("session", {"session_id": session_id})
                 harness_events = stream(
-                    message, access_token, session_id=session_id, user_permissions=entry.user_permissions
+                    message,
+                    access_token,
+                    session_id=session_id,
+                    user_permissions=entry.user_permissions,
+                    chat_summary=entry.chat_summary,
+                    chat_summary_covers_turns=entry.chat_summary_covers_turns,
                 )
             else:
                 harness_events = stream(
-                    message, access_token, resume=session_id, user_permissions=entry.user_permissions
+                    message,
+                    access_token,
+                    resume=session_id,
+                    user_permissions=entry.user_permissions,
+                    chat_summary=entry.chat_summary,
+                    chat_summary_covers_turns=entry.chat_summary_covers_turns,
                 )
 
             async for event in harness_events:
@@ -213,6 +271,13 @@ async def chat(
                 elif isinstance(event, Done):
                     store.touch(session_id)
                     entry.recent_actions.extend(event.recent_actions)
+                    # None means unchanged this turn (short session, or
+                    # regeneration failed) -- leave the entry's existing
+                    # summary alone rather than overwriting with a stale
+                    # duplicate.
+                    if event.chat_summary is not None:
+                        entry.chat_summary = event.chat_summary
+                        entry.chat_summary_covers_turns = event.chat_summary_covers_turns
                     yield _sse(
                         "done",
                         {

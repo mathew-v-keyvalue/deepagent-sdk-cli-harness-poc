@@ -32,7 +32,9 @@ from pathlib import Path
 from typing import Any
 
 from deepagents import create_deep_agent
-from langchain_core.messages import AIMessageChunk, HumanMessage
+from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
+from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 
 from harness.executor_tool import make_run_execution_plan_tool
@@ -129,6 +131,121 @@ def _render_user_permissions(user_permissions: dict[str, list[str]] | None) -> s
     lines = [f"- {resource}: {', '.join(actions)}" for resource, actions in sorted(user_permissions.items())]
     return "\n\nThis session's permission grants (resource: allowed actions):\n" + "\n".join(lines)
 
+
+# Bounded chat context (poc-wiki/incremental-development/): caps what the
+# model actually sees each call to the last N user-visible turns, folding
+# everything older into a rolling summary -- keeps a long session's per-call
+# token cost bounded without losing continuity. A "turn" here means one
+# HumanMessage plus everything the agent did in response, not one raw
+# LangGraph message -- confirmed live this week that a single turn can be
+# 10-19 internal messages (tool calls/results), so counting raw messages
+# would get consumed by a single turn and defeat the point. 6 is a
+# reasonable, easily-changed starting point, same posture as the existing
+# RECENT_ACTIONS_MAXLEN -- not a tuned number.
+CHAT_CONTEXT_WINDOW_TURNS = 6
+
+
+def _turn_boundaries(messages: list) -> list[int]:
+    """Index of each HumanMessage in `messages`, in order -- each one marks
+    where a new user-visible turn starts. Derived from the message list
+    itself, not tracked separately, so there's no extra state to keep in
+    sync with it."""
+    return [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
+
+
+def _render_chat_summary(summary: str) -> str:
+    """Empty string when absent, matching `_render_user_permissions`'s own
+    posture -- short sessions (at or under the window) never trigger any of
+    this, so the prompt doesn't grow for the common case."""
+    if not summary:
+        return ""
+    return f"\n\nSummary of this conversation before the messages shown below:\n{summary}"
+
+
+async def _update_chat_summary(previous_summary: str, newly_expired_messages: list) -> str:
+    """One cheap LLM call: fold `newly_expired_messages` (exactly the turns
+    that just aged out of the window, never the full history) into
+    `previous_summary`. Deliberately incremental -- re-summarizing the
+    entire conversation from scratch every time a turn expires would
+    reintroduce the exact unbounded-cost problem this feature exists to
+    solve. Uses the same model `resolve_model()` gives the main agent
+    (no separate "cheap model" config yet -- the cost win here comes from
+    never re-reading full history, not from a smaller model)."""
+    transcript = "\n".join(
+        f"{type(m).__name__}: {content}"
+        for m in newly_expired_messages
+        if (content := getattr(m, "content", None))
+    )
+    prompt = (
+        "Update the running summary of this conversation to fold in the new turn below. "
+        "Keep it concise -- a few sentences, not a transcript. Preserve anything from the "
+        "existing summary that's still relevant.\n\n"
+        f"Existing summary:\n{previous_summary or '(none yet)'}\n\n"
+        f"New turn to fold in:\n{transcript}\n\n"
+        "Updated summary:"
+    )
+    response = await resolve_model().ainvoke([HumanMessage(content=prompt)])
+    return _extract_text(response).strip()
+
+
+class _ChatSummaryResult:
+    """Mutable box the middleware reports its (possibly unchanged) summary
+    state into. Middleware instances are rebuilt fresh every turn (same as
+    everything else `_build_agent` assembles), so this is the only channel
+    for `stream()` to learn what happened, after the graph has finished
+    running, in time to include it in the `Done` event."""
+
+    def __init__(self, summary: str, covers_turns: int) -> None:
+        self.summary = summary
+        self.covers_turns = covers_turns
+        self.changed = False
+
+
+class _BoundedContextMiddleware(AgentMiddleware):
+    """See `CHAT_CONTEXT_WINDOW_TURNS`'s comment for what this does and why.
+    Never touches persisted checkpoint state -- same "shape only what's sent
+    to the model, leave history alone" principle as this file's own
+    checkpointer comment. A no-op for any session at or under the window
+    (the common case), so this adds no cost for short conversations."""
+
+    def __init__(self, result: _ChatSummaryResult) -> None:
+        self._result = result
+
+    async def awrap_model_call(self, request: ModelRequest, handler):
+        messages = request.messages
+        boundaries = _turn_boundaries(messages)
+        total_turns = len(boundaries)
+
+        if total_turns <= CHAT_CONTEXT_WINDOW_TURNS:
+            return await handler(request)
+
+        window_start_turn = total_turns - CHAT_CONTEXT_WINDOW_TURNS
+        window_start_idx = boundaries[window_start_turn]
+        window_messages = messages[window_start_idx:]
+
+        summary = self._result.summary
+        if window_start_turn > self._result.covers_turns:
+            # One or more turns aged out since the summary was last updated
+            # -- fold in only the newly-expired ones, never the whole thing.
+            newly_expired_start_idx = boundaries[self._result.covers_turns]
+            newly_expired = messages[newly_expired_start_idx:window_start_idx]
+            try:
+                summary = await _update_chat_summary(summary, newly_expired)
+                self._result.summary = summary
+                self._result.covers_turns = window_start_turn
+                self._result.changed = True
+            except Exception:
+                # Advisory data degrades, never blocks the turn -- same
+                # posture as the malformed-permissions-JSON handling in
+                # server/app.py. `summary` stays whatever it was; the window
+                # trim below still happens regardless.
+                logger.warning("chat summary regeneration failed; keeping the previous summary", exc_info=True)
+
+        existing_system_text = request.system_message.content if request.system_message else ""
+        new_system = SystemMessage(content=f"{existing_system_text}{_render_chat_summary(summary)}")
+        return await handler(request.override(messages=window_messages, system_message=new_system))
+
+
 # Mirrors eval/local/scoring.py's `_CYBERSIERRA_COMMAND_PATTERN` — catches a
 # model bypassing `run_execution_plan` and invoking `cybersierra <module>
 # <resource> <action>` directly via a raw shell/`execute` call. Not reachable
@@ -198,10 +315,28 @@ def _extract_plan_actions(tool_output: str | None) -> list[tuple[str, bool]]:
 
 # One checkpointer for the life of this process, shared by every session —
 # this IS the state; server/sessions.py (like the Claude POC's) holds only
-# a session-id -> lock/metadata mapping, never message history. Process-
-# lifetime, in-memory: same deliberate POC-scope choice as the Claude POC's
-# SessionStore, made explicit in README "Known limitations".
-_checkpointer = InMemorySaver()
+# a session-id -> lock/metadata mapping, never message history.
+#
+# Swappable, not a fixed InMemorySaver: server/app.py's lifespan hook calls
+# set_checkpointer() with an AsyncPostgresSaver when DATABASE_URL is
+# configured, making this durable and shared across processes; falls back
+# to this in-memory default otherwise (process-lifetime, lost on restart —
+# same deliberate POC-scope choice as before, now opt-in-out-of rather than
+# fixed). See poc-wiki/incremental-development/ for why this is a single
+# swapped-in checkpointer, not a hot in-memory layer plus a separate backup
+# synced by hand — that design was tried and found to silently corrupt
+# message history (LangGraph's `messages` channel is delta-based; copying
+# only the latest checkpoint's `channel_values` between two independent
+# checkpointer instances drops the ancestor chain delta reconstruction
+# depends on, confirmed live, not guessed). Using one real checkpointer
+# instance throughout — whichever one is active — sidesteps that entirely,
+# since LangGraph's own resume logic already handles it correctly.
+_checkpointer: BaseCheckpointSaver = InMemorySaver()
+
+
+def set_checkpointer(cp: BaseCheckpointSaver) -> None:
+    global _checkpointer
+    _checkpointer = cp
 
 # Passed through to the sandboxed shell backend's subprocess env so
 # `cybersierra`/`npm`/`npx`/`python3` resolve. HOME is what makes the CLI's
@@ -268,8 +403,9 @@ GRAPH_RECURSION_LIMIT = 500
 def _build_agent(
     access_token: str = "",
     *,
-    checkpointer: InMemorySaver | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
     user_permissions: dict[str, list[str]] | None = None,
+    chat_summary_result: _ChatSummaryResult | None = None,
 ):
     """The one place that assembles this harness's DeepAgents graph.
 
@@ -385,11 +521,16 @@ def _build_agent(
         redact=access_token,  # scrub from cli_call_* log lines only, see harness/sandbox.py
     )
 
+    # Fresh throwaway box when the caller doesn't track this (e.g. run(),
+    # which has no session concept at all) -- the middleware still works
+    # correctly, its result box just has nothing to read it afterward.
+    chat_summary_result = chat_summary_result or _ChatSummaryResult("", 0)
+
     return create_deep_agent(
         model=resolve_model(),
         system_prompt=SYSTEM_PROMPT_APPENDIX + _render_user_permissions(user_permissions),
         tools=[make_run_execution_plan_tool(backend)],
-        middleware=[ShellSandboxMiddleware(redact=access_token)],
+        middleware=[ShellSandboxMiddleware(redact=access_token), _BoundedContextMiddleware(chat_summary_result)],
         skills=[str(SKILLS_ROOT)],
         backend=backend,
         checkpointer=checkpointer if checkpointer is not None else _checkpointer,
@@ -610,6 +751,13 @@ class Done:
     usage: dict[str, Any] | None
     num_turns: int | None
     recent_actions: list[RecentAction]
+    # None when the chat summary didn't change this turn (short session, or
+    # regeneration failed and the previous one was kept as-is) -- the caller
+    # (server/app.py) should leave SessionEntry.chat_summary/
+    # chat_summary_covers_turns untouched in that case, not overwrite with
+    # a stale/duplicate value.
+    chat_summary: str | None = None
+    chat_summary_covers_turns: int | None = None
 
 
 @dataclass
@@ -647,6 +795,8 @@ async def stream(
     session_id: str | None = None,
     resume: str | None = None,
     user_permissions: dict[str, list[str]] | None = None,
+    chat_summary: str = "",
+    chat_summary_covers_turns: int = 0,
 ) -> AsyncIterator[HarnessEvent]:
     """Run one turn, yielding incremental events as they arrive.
 
@@ -693,9 +843,10 @@ async def stream(
     recent_actions: list[RecentAction] = []
     llm_tracker = _LlmCallTracker()
     final_text = ""
+    chat_summary_result = _ChatSummaryResult(chat_summary, chat_summary_covers_turns)
 
     try:
-        graph = _build_agent(access_token, user_permissions=user_permissions)
+        graph = _build_agent(access_token, user_permissions=user_permissions, chat_summary_result=chat_summary_result)
 
         with Netra.start_span("Agent_Turn", as_type=SpanType.TOOL, module_name="agent") as span:
             span.set_attribute("agent.thread_id", thread_id)
@@ -861,6 +1012,8 @@ async def stream(
                     usage=usage_totals or None,
                     num_turns=num_turns or None,
                     recent_actions=recent_actions,
+                    chat_summary=chat_summary_result.summary if chat_summary_result.changed else None,
+                    chat_summary_covers_turns=chat_summary_result.covers_turns if chat_summary_result.changed else None,
                 )
             except Exception as exc:  # noqa: BLE001 — mirrors the outer handler below
                 span.set_attribute("agent.status", "failed")

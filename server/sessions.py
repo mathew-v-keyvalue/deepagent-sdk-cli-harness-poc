@@ -70,6 +70,14 @@ class SessionEntry:
     # second staleness window needed here). None until the first call that
     # sends it.
     user_permissions: dict[str, list[str]] | None = None
+    # Rolling summary of everything before harness.agent's bounded-context
+    # window (poc-wiki/incremental-development/) -- covers_turns is how
+    # many user-visible turns are already folded into `summary`, so the
+    # middleware knows exactly which *newly*-expired turns still need
+    # folding in on a later call, rather than re-summarizing from scratch.
+    # Both empty/0 until a session's history actually exceeds the window.
+    chat_summary: str = ""
+    chat_summary_covers_turns: int = 0
 
 
 class SessionStore:
