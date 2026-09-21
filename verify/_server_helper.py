@@ -8,6 +8,7 @@ into (event, data, timestamp) tuples.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import subprocess
 import sys
@@ -19,6 +20,13 @@ import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# Every verify_server_*.py script's requests to /chat must carry this as the
+# X-Service-Auth header, matching what running_server() below sets in the
+# subprocess's own env — /chat now fails closed (401) without it (see
+# server/app.py's _verify_service_auth). Arbitrary value; only used by these
+# scripts and the ephemeral subprocess they launch, never a real deployment.
+TEST_SERVICE_AUTH = "verify-scripts-test-secret"
+
 
 @contextlib.contextmanager
 def running_server(port: int = 8098, timeout: float = 20.0, extra_env: dict[str, str] | None = None) -> Iterator[str]:
@@ -29,10 +37,12 @@ def running_server(port: int = 8098, timeout: float = 20.0, extra_env: dict[str,
     *server subprocess only* — e.g. `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` for
     `verify_server_multi_session_isolation.py`'s env-isolation check, which
     needs that opt-in on (see `harness/agent.py`) without turning it on for
-    every other verify script or this process itself.
+    every other verify script or this process itself. `DEEPAGENT_SERVICE_AUTH`
+    is always set to `TEST_SERVICE_AUTH` here (overridable via `extra_env` if
+    a script ever needs to test the auth-rejection path itself).
     """
     base_url = f"http://127.0.0.1:{port}"
-    env = {**os.environ, **(extra_env or {})}
+    env = {**os.environ, "DEEPAGENT_SERVICE_AUTH": TEST_SERVICE_AUTH, **(extra_env or {})}
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "server.app:app", "--port", str(port), "--log-level", "warning"],
         cwd=str(PROJECT_ROOT),
@@ -67,8 +77,6 @@ async def read_sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, 
     verify_server_streaming_incremental.py to prove deltas arrive spread
     out over real wall-clock time, not all at once.
     """
-    import json
-
     event_name = "message"
     data_lines: list[str] = []
 
@@ -82,3 +90,20 @@ async def read_sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, 
                 yield event_name, json.loads("".join(data_lines)), time.monotonic()
             event_name = "message"
             data_lines = []
+
+
+def _extract_text(resp: httpx.Response) -> str:
+    """Concatenate every `TextDelta`'s `text` field out of a non-streaming
+    SSE response body — shared by verify_server_fresh_deployment_no_profile.py
+    and verify_server_multi_session_isolation.py.
+    """
+    text = ""
+    for line in resp.text.splitlines():
+        if line.startswith("data:"):
+            try:
+                payload = json.loads(line[len("data:") :].strip())
+            except json.JSONDecodeError:
+                continue
+            if "text" in payload:
+                text += payload["text"]
+    return text

@@ -30,7 +30,7 @@ The `cybersierra` CLI is distributed as an npm package: `@cybersierra/cybersierr
 **Before running any `cybersierra` command**, check if it is installed:
 
 ```bash
-which cybersierra || npm list -g @cybersierra/cybersierra-cli
+npm list -g @cybersierra/cybersierra-cli
 ```
 
 If the command is not found or the package is not installed, install it globally:
@@ -134,20 +134,25 @@ If the skill references commands missing from the manifest, set `error` ("Skill 
 
 **If `matchedSkill` is null — Planner:**
 
-Fetch manifests for the identified modules:
+For each identified module, first see what resources/actions it actually exposes using the CLI's own help text — this is faster and more reliable than hand-writing Python against the raw manifest, and does not require getting a JSON-parsing script right on the first try:
+
+```bash
+cybersierra <module> --help
+```
+
+Only once you know which specific resource/action you need, fetch its exact schema (path, method, params) from the manifest:
 
 ```bash
 cybersierra manifest --raw | python3 -c "
 import json, sys
 tree = json.load(sys.stdin)['tree']
-modules = ['MODULE_1', 'MODULE_2']
-out = {}
-for m in modules:
-    if m in tree:
-        out[m] = tree[m]
-print(json.dumps(out, indent=2))
+for op in tree.get('MODULE', []):
+    if op['resource'] == 'RESOURCE' and op['action'] == 'ACTION':
+        print(json.dumps(op, indent=2))
 "
 ```
+
+Do not dump the entire manifest tree (all modules, or an entire module's full operation list) speculatively — filter to the one operation you've already identified via `--help`. If a first attempt at this returns no output or looks wrong, re-check the `--help` output for the exact resource/action spelling rather than retrying a different hand-written script.
 
 Read `_internal/planner/SKILL.md`. Follow its instructions to generate the plan. The Planner will load its own references (`references/planning-rules.md`, `references/execution-plan-schema.md`) as needed.
 
@@ -171,15 +176,17 @@ The Executor is deterministic runtime logic. It:
 
 1. Ensures the `cybersierra` CLI is available:
    ```bash
-   which cybersierra || npm install -g @cybersierra/cybersierra-cli
+   npm list -g @cybersierra/cybersierra-cli || npm install -g @cybersierra/cybersierra-cli
    ```
    If installation fails, halt and report the error to the user.
 
-2. Runs `cybersierra auth whoami` — if exit code is non-zero (authentication required):
+2. Does **not** proactively check authentication before running plan steps — this environment's credentials are already resolved and valid before execution starts, so a precondition `whoami` check never changes the outcome and only costs a wasted round trip. Proceed directly to step 3.
 
-   ### Authentication Protocol (Mandatory)
+   If a step in 3-4 below actually fails with a non-zero exit code that indicates an invalid, expired, or unauthorized credential (not any other kind of error), only then invoke the Authentication Protocol reactively:
 
-   Authentication is a required checkpoint. Do **not** continue execution until authentication has completed successfully.
+   ### Authentication Protocol (Mandatory once triggered by an actual auth failure)
+
+   Authentication is a required checkpoint once triggered. Do **not** continue execution until authentication has completed successfully.
 
    **Primary flow — `login-browser`:**
 
@@ -260,7 +267,7 @@ When presenting compliance data to the user after execution:
 
 ## First-Run & Onboarding
 
-When `cybersierra auth whoami` fails and no prior session exists, this is likely a first-time user. Guide them through setup:
+When a step's reactive auth check (Execute step 2) finds no prior session/credentials at all, this is likely a first-time user. Guide them through setup:
 
 1. **Greet**: "Welcome to Cyber Sierra. Let's get you connected."
 2. **Authenticate**: Run the Authentication Protocol (uses production by default).

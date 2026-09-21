@@ -6,10 +6,10 @@ __pycache__/
 dist/
 build/
 
-# dataset/run_dataset.py's output -- real run results (may include real
-# tenant/vendor data from your cybersierra backend), not the dataset itself
-dataset/results.json
-dataset/results/
+# eval/**/*.py run output -- real run results (may include real tenant/
+# vendor data from your cybersierra backend, and local Netra org/dataset
+# state), not the eval framework code itself
+eval/results/
 
 # harness/observability.py's rotating log file -- runtime output, not
 # something to commit (also may contain real CLI output/tenant data,

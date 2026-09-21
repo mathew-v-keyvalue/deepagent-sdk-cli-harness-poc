@@ -22,18 +22,21 @@ recalling "Ada" from a prior turn.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 
 import httpx
 
-from _server_helper import running_server
+from _server_helper import TEST_SERVICE_AUTH, running_server
 
 PLACEHOLDER_TOKEN = "placeholder-token-not-real"
 
 
 async def main() -> int:
     with running_server(port=8099) as base_url:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(
+            timeout=60.0, headers={"X-Service-Auth": TEST_SERVICE_AUTH}
+        ) as client:
             resp1 = await client.post(
                 f"{base_url}/chat",
                 data={"message": "My name is Ada Lovelace.", "access_token": PLACEHOLDER_TOKEN},
@@ -45,8 +48,6 @@ async def main() -> int:
             session_id = None
             for line in resp1.text.splitlines():
                 if line.startswith("data:") and '"session_id"' in line:
-                    import json
-
                     session_id = json.loads(line[len("data:") :].strip()).get("session_id")
                     break
             if not session_id:
@@ -69,8 +70,6 @@ async def main() -> int:
             full_text = ""
             for line in resp2.text.splitlines():
                 if line.startswith("data:"):
-                    import json
-
                     try:
                         payload = json.loads(line[len("data:") :].strip())
                     except json.JSONDecodeError:

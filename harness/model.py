@@ -30,7 +30,7 @@ _REQUIRED_KEY_BY_PROVIDER = {
 
 
 def resolve_model() -> BaseChatModel:
-    """Build the chat model from `AGENT_MODEL` (default: Anthropic).
+    """Build the chat model from `AGENT_MODEL` (default: OpenAI, `openai:gpt-5.1`).
 
     Reads `AGENT_MODEL` fresh on every call rather than caching a module-
     level model instance, so a changed env var takes effect on server

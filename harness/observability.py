@@ -30,6 +30,8 @@ import logging.handlers
 import os
 from pathlib import Path
 
+from harness.console_format import ConsoleStoryFilter, PrettyConsoleFormatter, color_enabled
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 _CONFIGURED = False
@@ -53,6 +55,13 @@ def configure_logging() -> None:
             ~60 MiB total, not an unbounded file — this logs full CLI
             stdout/stderr previews and tool args on every call, which adds
             up over a long-running server).
+        HARNESS_LOG_PRETTY — default "1". The console handler (only —
+            `logs/harness.log` is always the full, dense, machine-format
+            line) renders as a short colorized story instead — see
+            harness/console_format.py. Set to "0" to get the old dense
+            format on console too.
+        HARNESS_LOG_COLOR — "auto" (default, color iff stderr is a real
+            terminal) / "always" / "never". See harness/console_format.py.
     """
     global _CONFIGURED
     if _CONFIGURED:
@@ -66,7 +75,11 @@ def configure_logging() -> None:
     handlers: list[logging.Handler] = []
 
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+    if os.environ.get("HARNESS_LOG_PRETTY", "1") != "0":
+        console_handler.setFormatter(PrettyConsoleFormatter(use_color=color_enabled()))
+        console_handler.addFilter(ConsoleStoryFilter())
+    else:
+        console_handler.setFormatter(formatter)  # old dense format, unchanged escape hatch
     handlers.append(console_handler)
 
     log_file_setting = os.environ.get("HARNESS_LOG_FILE", str(_DEFAULT_LOG_FILE))

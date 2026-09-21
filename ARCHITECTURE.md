@@ -162,7 +162,7 @@ flowchart LR
 ## 5. Access-token decision (default vs. injection mode)
 
 Two sequential fixes, each caught by a direct question, not by testing:
-(1) unconditionally injecting `access_token` as `CYBERSIERRA_TOKEN`
+(1) unconditionally injecting `access_token` into the subprocess env
 overrode an already-authenticated `cybersierra auth login-browser` session
 with a UI placeholder, since the CLI's `??` fallback only triggers on a
 *missing* env var, not a wrong one — fixed by making injection opt-in;
@@ -170,16 +170,35 @@ with a UI placeholder, since the CLI's `??` fallback only triggers on a
 no real reason in this POC's scope — fixed by dropping the requirement
 entirely (`400 no_token` removed).
 
+**Correction:** the diagram and prose below originally named the override
+variable `CYBERSIERRA_TOKEN`. That was never correct — the real installed
+CLI binary contains zero references to that string; the actual variable it
+reads is `MORPHEUS_TOKEN` (confirmed by reading the binary's own
+profile-resolution code and reproducing live — see README "Authentication
+model" for the full correction). Fixed below.
+
+**Second correction, added alongside the first:** the diagram below
+originally implied `MORPHEUS_TOKEN` injection was the *only* thing needed
+for a real deployment. It isn't — `MORPHEUS_BASE_URL` also has to resolve,
+and nothing previously forwarded it to the subprocess at all (this repo's
+own `CYBERSIERRA_BASE_URL` was dead config). Unlike token injection, this
+is deployment-wide, not per-request, so it's injected unconditionally,
+independent of the `CYBERSIERRA_INJECT_ACCESS_TOKEN` branch entirely — see
+the new `BASEURL` node below and README "Authentication model" (Fix 3) for
+the full story.
+
 ```mermaid
 flowchart TD
     START["_build_agent(access_token='' by default) builds the subprocess env"]
+    BASEURL["MORPHEUS_BASE_URL = CYBERSIERRA_BASE_URL,<br/>injected unconditionally if set --<br/>independent of the branch below,<br/>same for every user/request"]
     CHECK{"CYBERSIERRA_INJECT_ACCESS_TOKEN set?"}
+    START --> BASEURL
     START --> CHECK
 
-    CHECK -- "unset (default)" --> DEFAULT["CYBERSIERRA_TOKEN key NOT added to env<br/>CLI's own token ?? persistedProfile.token<br/>resolves to the persisted profile"]
+    CHECK -- "unset (default)" --> DEFAULT["MORPHEUS_TOKEN key NOT added to env<br/>CLI's own token ?? persistedProfile.token<br/>resolves to the persisted profile"]
     DEFAULT --> ASSUME["Matches 'assume already authenticated'<br/>— one-time cybersierra auth login-browser<br/>covers every /chat call.<br/>access_token is fully OPTIONAL now<br/>(400 no_token removed — see README)."]
 
-    CHECK -- "=1 (opt-in)" --> INJECT["CYBERSIERRA_TOKEN = access_token<br/>added to the subprocess env,<br/>only if access_token is non-empty"]
+    CHECK -- "=1 (opt-in)" --> INJECT["MORPHEUS_TOKEN = access_token<br/>added to the subprocess env,<br/>only if access_token is non-empty"]
     INJECT --> REAL["CLI uses this value, overriding<br/>whatever profile is on disk.<br/>access_token MUST be a real per-user JWT<br/>or every cybersierra call fails."]
-    REAL --> SHAPE["The mechanism a real shape-B/C<br/>multi-tenant deployment would need —<br/>exercised by<br/>verify_server_multi_session_isolation.py"]
+    REAL --> SHAPE["The mechanism a real shape-B/C<br/>multi-tenant deployment would need —<br/>exercised by<br/>verify_server_multi_session_isolation.py.<br/>Combined with BASEURL above, needs<br/>zero persisted profile on any host."]
 ```

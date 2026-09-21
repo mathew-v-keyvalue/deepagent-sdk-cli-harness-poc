@@ -9,16 +9,47 @@ claim is about `harness.agent._checkpointer` (an `InMemorySaver`, also
 process-lifetime) — same shape, see README "Session continuity: checkpointer
 vs on-disk transcript" for how that comparison holds and one place it
 doesn't (a checkpointer never raises on an unknown thread_id the way the
-Claude SDK's `resume` does; this store, not the checkpointer, is what makes
-`unknown_session` a real 404 here too).
+Claude SDK's `resume` does — see below for how that observation has
+changed since this was first written).
+
+Behavior change: a caller-supplied session_id unknown to this store no
+longer 404s as `unknown_session` — `server/app.py`'s `/chat` handler now
+calls `create(session_id)` below and proceeds as a fresh session instead,
+so a frontend-minted id can be used starting from message #1 rather than
+only a server-minted one. Deliberate tradeoff, not free: this collapses
+two previously-distinguishable cases into one. "Genuinely new, frontend-
+minted id, never sent before" (the case this exists for) and "a real prior
+session whose id this store has since forgotten — e.g. a server restart
+wiped this dict" (previously a loud 404) are now indistinguishable from
+this store's point of view; the latter now silently starts a brand-new
+empty conversation instead of erroring, mirroring exactly the
+checkpointer's own long-documented "unseen thread_id just starts fresh,
+no error" behavior referenced above. `404 unknown_session` is no longer
+reachable through any code path in `server/app.py`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from uuid import uuid4
+
+from harness.agent import MessageIntentLabel, RecentAction
+
+# Bounds SessionEntry.recent_actions — a small, fixed-capacity ring buffer,
+# not a full history (that's the checkpointer's job). 20 is a reasonable,
+# easily-changed starting point: enough to cover a multi-step plan plus
+# some turn-to-turn history.
+RECENT_ACTIONS_MAXLEN = 20
+
+
+@dataclass
+class MessageIntent:
+    intent: MessageIntentLabel
+    message_preview: str
+    timestamp: float
 
 
 @dataclass
@@ -26,14 +57,54 @@ class SessionEntry:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     created_at: float = field(default_factory=time.monotonic)
     last_active_at: float = field(default_factory=time.monotonic)
+    # Recent real CLI-shaped actions this session took and whether each
+    # succeeded — survives across turns (unlike harness.agent.stream()'s
+    # own per-turn actual_commands_seen/actual_outputs_seen locals, which
+    # are discarded the instant a turn ends). Deliberately a derived
+    # convenience cache, not a new source of truth: the checkpointer's
+    # message history remains authoritative. See poc-wiki/
+    # incremental-development/ for why this exists.
+    recent_actions: deque[RecentAction] = field(
+        default_factory=lambda: deque(maxlen=RECENT_ACTIONS_MAXLEN)
+    )
+    # Advisory-only permission grants resolved server-side by
+    # morpheus_backend's Casbin integration (poc-wiki/incremental-
+    # development/0003-user-permission-contract-design.md) — resource ->
+    # deduped action-name list, e.g. {"assessment": ["CREATE", "VIEW"]}.
+    # Never used to block/gate anything; refreshed on every /chat call that
+    # includes it, not just session creation (matches the backend's own
+    # cadence decision — its Redis cache already bounds staleness, no
+    # second staleness window needed here). None until the first call that
+    # sends it.
+    user_permissions: dict[str, list[str]] | None = None
+    # Rolling summary of everything before harness.agent's bounded-context
+    # window (poc-wiki/incremental-development/) -- covers_turns is how
+    # many user-visible turns are already folded into `summary`, so the
+    # middleware knows exactly which *newly*-expired turns still need
+    # folding in on a later call, rather than re-summarizing from scratch.
+    # Both empty/0 until a session's history actually exceeds the window.
+    chat_summary: str = ""
+    chat_summary_covers_turns: int = 0
+    # Same bounded-ring-buffer shape/cap as recent_actions -- classification
+    # is best-effort (see harness.agent._classify_message_intent), so a turn
+    # with no successful classification just doesn't append here, it's not
+    # backfilled or retried. Not read/routed on by anything yet -- see
+    # poc-wiki/incremental-development/.
+    recent_intents: deque[MessageIntent] = field(
+        default_factory=lambda: deque(maxlen=RECENT_ACTIONS_MAXLEN)
+    )
 
 
 class SessionStore:
     def __init__(self) -> None:
         self._sessions: dict[str, SessionEntry] = {}
 
-    def create(self) -> str:
-        session_id = str(uuid4())
+    def create(self, session_id: str | None = None) -> str:
+        """Start tracking a session, minting a new id unless the caller
+        supplies one — needed so a client-chosen id (e.g. one the frontend
+        minted before the first request) can be used from turn one instead
+        of only ids this store generates itself."""
+        session_id = session_id or str(uuid4())
         self._sessions[session_id] = SessionEntry()
         return session_id
 

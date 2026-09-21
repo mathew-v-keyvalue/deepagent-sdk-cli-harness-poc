@@ -9,7 +9,7 @@ The `cybersierra` CLI is distributed as the npm package `@cybersierra/cybersierr
 Before running any `cybersierra` command, verify it is installed:
 
 ```bash
-which cybersierra || npm install -g @cybersierra/cybersierra-cli
+npm list -g @cybersierra/cybersierra-cli || npm install -g @cybersierra/cybersierra-cli
 ```
 
 If `cybersierra` is not found, install it globally before proceeding. After installation it will be available on PATH.

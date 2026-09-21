@@ -21,20 +21,28 @@ doesn't.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
+import re
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from deepagents import create_deep_agent
-from langchain_core.messages import AIMessageChunk, HumanMessage
+from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
+from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
+from pydantic import BaseModel
 
 from harness.executor_tool import make_run_execution_plan_tool
 from harness.model import resolve_model
 from harness.sandbox import AllowlistedShellBackend, ShellSandboxMiddleware, scrub
+from harness.tracing import Netra, SpanType, trace_content_enabled
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SKILLS_ROOT = PROJECT_ROOT / "skills"
@@ -49,80 +57,347 @@ logger = logging.getLogger("harness.agent")
 logger.addHandler(logging.NullHandler())
 
 # Generic-only, same spirit as the Claude POC's SYSTEM_PROMPT_APPENDIX: no
-# mention of cybersierra, compliance, or any specific command. Three
+# mention of cybersierra, compliance, or any specific command. Two
 # additions that ARE harness-specific (not domain-specific): the tool-name
 # bridge (the real skill's frontmatter and body were authored for Claude
 # Code's tool names — `Bash`, `Read`, `Write` — and DeepAgents' names differ
 # — `execute`, `read_file`, `write_file`; rather than edit the ported skill
 # files, see skills/cyber-sierra/, copied verbatim on purpose as primary
-# source, we bridge the naming gap here), the "read before guessing" line —
-# added after dataset/README.md's spot-checking caught the model guessing
-# plausible-but-wrong CLI subcommands (`cybersierra vendors list`,
-# `cybersierra get vendors`, ...) instead of reading the loaded skill fully
-# first, even though that skill's own text already says to discover the
-# real command surface before acting (see dataset/README.md "Observed
-# limitation" for the before/after log evidence) — and the "skip confirm
-# on read-only plans" line. That last one resolves a real contradiction
-# inside the copied skill itself, not a harness bug: SKILL.md's own Step 4
-# ("Present Plan & Confirm") says to ask for confirmation before every
-# plan, full stop, while _internal/shared/manifest-usage.md's "Safety"
-# section says `safe: true` (read-only) commands should "execute freely"
-# and only `safe: false` ones "require user confirmation" — Step 5
-# (Execute) agrees with the second version. Observed in practice: a
-# read-only, single-step plan (e.g. listing records with no write
-# involved) still stopped to ask "shall I proceed?", which breaks any
-# fully-automated run (this repo's own dataset run included — every
-# dataset/query_dataset.json entry is deliberately read-only) since those
-# expect one turn in, one real answer out, not a second turn to approve a
-# plan that never needed approving. Per "copied verbatim on purpose,"
-# SKILL.md itself was not edited to resolve this — the contradiction is
-# resolved here instead, in the safer direction the CLI's own norm and
-# manifest-usage.md already state.
+# source, we bridge the naming gap here), and the "read before guessing" /
+# discovery-escalation lines — added after eval/README.md's spot-checking
+# caught the model guessing plausible-but-wrong CLI subcommands (`cybersierra
+# vendors list`, `cybersierra get vendors`, ...) instead of reading the
+# loaded skill fully first, even though that skill's own text already says
+# to discover the real command surface before acting (see eval/README.md
+# "Observed limitation" for the before/after log evidence).
+#
+# A third addition — telling the model to skip the plan-confirmation step
+# for read-only plans — was tried and then deliberately removed. It bypassed
+# the real skill's own Step 4 ("Present Plan & Confirm") gate, which the
+# rest of this port treats as sacrosanct (see README "Porting the real
+# pipeline" — the soft, instruction-based confirmation gate is called out
+# explicitly as intentional, matching the source system's own design, not
+# something to route around at the harness level). If read-only plans
+# stopping to confirm is a real problem, the right fix is resolving the
+# contradiction inside skills/cyber-sierra/ itself (a disclosed exception to
+# "copied verbatim"), not overriding confirmation behavior from the harness.
+#
+# A fourth addition (2026-09-07): skip any skill-prescribed proactive
+# identity/auth precondition check (e.g. a "whoami"-style command run before
+# every action, independent of any actual failure). Confirmed live in a
+# `/chat` session log that this harness always resolves credentials before
+# the model's turn starts (persisted CLI profile, or the per-request
+# MORPHEUS_TOKEN injection in `_build_agent` below), and `harness/
+# sandbox.py`'s ALLOWED_DESPITE_DENIED_PREFIXES/DENIED_COMMAND_PREFIXES deny
+# the rest of that check's own remediation path (interactive login) anyway
+# — so the proactive check can only ever burn a call/turn, never change the
+# outcome. This is a harness-level override, not a skill edit, since the
+# skill text prescribing it is a verbatim port reused outside this project.
+#
+# A fifth addition (2026-09-16): when a manifest operation carries a
+# requiredPermission field, compare it against this session's permission
+# grants (rendered separately, see _render_user_permissions below) and flag
+# a step that will fail on permission grounds before running anything,
+# rather than discovering it mid-plan. See poc-wiki/incremental-
+# development/0004-plan-time-permission-checking.md and 0005-cli-manifest-
+# extension-proposal.md — this is "Case 1" from that design.
+#
+# A sixth addition, same date: react to a plan step failing with exit code
+# 4 (forbidden) by naming what already succeeded and what's actually
+# missing, instead of a generic error — the fallback for every command not
+# yet covered by the fifth addition above ("Case 2" in the same docs), and
+# the only behavior that fires today, since the manifest annotation this
+# depends on is a separate, not-yet-landed change in morpheus_backend.
+#
+# The instruction text itself lives in prompts/system_prompt_appendix.md
+# (plain text, one paragraph per blank-line-separated block, loaded verbatim
+# below) so it can be edited without touching this module — the rationale
+# comments above stay here as the audit trail of *why* each paragraph in
+# that file exists; a new paragraph there should get a matching numbered
+# entry here.
 SYSTEM_PROMPT_APPENDIX = (
-    "If an available skill matches the user's request, use it rather than "
-    "answering from general knowledge alone.\n\n"
-    "This environment's tool names differ from the ones referenced inside "
-    "loaded skill files, which were authored for a different agent runtime. "
-    "Map them as follows: `Bash` and `Shell` both mean this environment's "
-    "`execute` tool (same shell-command semantics); `Read` means `read_file` "
-    "(pass limit=1000 for files longer than 100 lines, per the Skills System "
-    "instructions already in this prompt); `Write` means `write_file`.\n\n"
-    "Before running any shell command against a domain CLI referenced by a "
-    "loaded skill, read that skill's full instructions first with read_file "
-    "-- do not guess subcommand names or flags from general knowledge, even "
-    "ones that sound plausible. If the skill describes how to discover the "
-    "CLI's real command surface (e.g. a manifest or catalog command), run "
-    "that discovery step before attempting any other command against that "
-    "CLI, and only use commands that discovery step actually returned.\n\n"
-    "A discovery command that returns only shallow, high-level results (for "
-    "example, top-level category or module names with no further detail) is "
-    "not sufficient to act on -- it means you must go one level deeper (e.g. "
-    "that CLI's own --help on the specific subcommand or category you just "
-    "identified) before trying an actual command, not that you should start "
-    "guessing plausible-sounding subcommand or flag names. If two guesses "
-    "against the same CLI fail in a row, stop guessing and escalate to that "
-    "CLI's own --help instead of trying a third guess; never repeat the "
-    "exact same shallow discovery call more than once without escalating.\n\n"
-    "When a loaded skill's plan-and-confirm step distinguishes read-only "
-    "actions from state-changing ones (however that skill labels the "
-    "distinction, e.g. `safe: true` / `safe: false`), only pause for the "
-    "user's explicit confirmation before executing when the plan contains "
-    "at least one state-changing action. If every action in the plan is "
-    "read-only, execute the plan directly and report the result -- do not "
-    "ask the user to confirm a plan that changes nothing."
-)
+    Path(__file__).resolve().parent / "prompts" / "system_prompt_appendix.md"
+).read_text().strip()
+
+
+def _render_user_permissions(user_permissions: dict[str, list[str]] | None) -> str:
+    """Renders this session's resolved permission grants (poc-wiki/
+    incremental-development/0003-user-permission-contract-design.md) into
+    the plain text the system prompt's fifth addition above tells the
+    model to compare a manifest operation's requiredPermission against.
+    Empty string when absent, so the prompt doesn't grow for callers that
+    never send this (e.g. the verify/*.py scripts).
+    """
+    if not user_permissions:
+        return ""
+    lines = [f"- {resource}: {', '.join(actions)}" for resource, actions in sorted(user_permissions.items())]
+    return "\n\nThis session's permission grants (resource: allowed actions):\n" + "\n".join(lines)
+
+
+# Bounded chat context (poc-wiki/incremental-development/): caps what the
+# model actually sees each call to the last N user-visible turns, folding
+# everything older into a rolling summary -- keeps a long session's per-call
+# token cost bounded without losing continuity. A "turn" here means one
+# HumanMessage plus everything the agent did in response, not one raw
+# LangGraph message -- confirmed live this week that a single turn can be
+# 10-19 internal messages (tool calls/results), so counting raw messages
+# would get consumed by a single turn and defeat the point. 6 is a
+# reasonable, easily-changed starting point, same posture as the existing
+# RECENT_ACTIONS_MAXLEN -- not a tuned number.
+CHAT_CONTEXT_WINDOW_TURNS = 6
+
+
+def _turn_boundaries(messages: list) -> list[int]:
+    """Index of each HumanMessage in `messages`, in order -- each one marks
+    where a new user-visible turn starts. Derived from the message list
+    itself, not tracked separately, so there's no extra state to keep in
+    sync with it."""
+    return [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
+
+
+def _render_chat_summary(summary: str) -> str:
+    """Empty string when absent, matching `_render_user_permissions`'s own
+    posture -- short sessions (at or under the window) never trigger any of
+    this, so the prompt doesn't grow for the common case."""
+    if not summary:
+        return ""
+    return f"\n\nSummary of this conversation before the messages shown below:\n{summary}"
+
+
+async def _update_chat_summary(previous_summary: str, newly_expired_messages: list) -> str:
+    """One cheap LLM call: fold `newly_expired_messages` (exactly the turns
+    that just aged out of the window, never the full history) into
+    `previous_summary`. Deliberately incremental -- re-summarizing the
+    entire conversation from scratch every time a turn expires would
+    reintroduce the exact unbounded-cost problem this feature exists to
+    solve. Uses the same model `resolve_model()` gives the main agent
+    (no separate "cheap model" config yet -- the cost win here comes from
+    never re-reading full history, not from a smaller model)."""
+    transcript = "\n".join(
+        f"{type(m).__name__}: {content}"
+        for m in newly_expired_messages
+        if (content := getattr(m, "content", None))
+    )
+    prompt = (
+        "Update the running summary of this conversation to fold in the new turn below. "
+        "Keep it concise -- a few sentences, not a transcript. Preserve anything from the "
+        "existing summary that's still relevant.\n\n"
+        f"Existing summary:\n{previous_summary or '(none yet)'}\n\n"
+        f"New turn to fold in:\n{transcript}\n\n"
+        "Updated summary:"
+    )
+    response = await resolve_model().ainvoke([HumanMessage(content=prompt)])
+    return _extract_text(response).strip()
+
+
+class _ChatSummaryResult:
+    """Mutable box the middleware reports its (possibly unchanged) summary
+    state into. Middleware instances are rebuilt fresh every turn (same as
+    everything else `_build_agent` assembles), so this is the only channel
+    for `stream()` to learn what happened, after the graph has finished
+    running, in time to include it in the `Done` event."""
+
+    def __init__(self, summary: str, covers_turns: int) -> None:
+        self.summary = summary
+        self.covers_turns = covers_turns
+        self.changed = False
+
+
+class _BoundedContextMiddleware(AgentMiddleware):
+    """See `CHAT_CONTEXT_WINDOW_TURNS`'s comment for what this does and why.
+    Never touches persisted checkpoint state -- same "shape only what's sent
+    to the model, leave history alone" principle as this file's own
+    checkpointer comment. A no-op for any session at or under the window
+    (the common case), so this adds no cost for short conversations."""
+
+    def __init__(self, result: _ChatSummaryResult) -> None:
+        self._result = result
+
+    async def awrap_model_call(self, request: ModelRequest, handler):
+        messages = request.messages
+        boundaries = _turn_boundaries(messages)
+        total_turns = len(boundaries)
+
+        if total_turns <= CHAT_CONTEXT_WINDOW_TURNS:
+            return await handler(request)
+
+        window_start_turn = total_turns - CHAT_CONTEXT_WINDOW_TURNS
+        window_start_idx = boundaries[window_start_turn]
+        window_messages = messages[window_start_idx:]
+
+        summary = self._result.summary
+        if window_start_turn > self._result.covers_turns:
+            # One or more turns aged out since the summary was last updated
+            # -- fold in only the newly-expired ones, never the whole thing.
+            newly_expired_start_idx = boundaries[self._result.covers_turns]
+            newly_expired = messages[newly_expired_start_idx:window_start_idx]
+            try:
+                summary = await _update_chat_summary(summary, newly_expired)
+                self._result.summary = summary
+                self._result.covers_turns = window_start_turn
+                self._result.changed = True
+            except Exception:
+                # Advisory data degrades, never blocks the turn -- same
+                # posture as the malformed-permissions-JSON handling in
+                # server/app.py. `summary` stays whatever it was; the window
+                # trim below still happens regardless.
+                logger.warning("chat summary regeneration failed; keeping the previous summary", exc_info=True)
+
+        existing_system_text = request.system_message.content if request.system_message else ""
+        new_system = SystemMessage(content=f"{existing_system_text}{_render_chat_summary(summary)}")
+        return await handler(request.override(messages=window_messages, system_message=new_system))
+
+
+# Message intent classification (poc-wiki/incremental-development/): the
+# shape of a request, not its specific CLI resource -- this system
+# deliberately has no hardcoded resource/module vocabulary (everything is
+# discovered live via `cybersierra manifest --raw`, see skills/cyber-sierra/
+# _internal/planner/references/planning-rules.md's "No hardcoded CLI
+# knowledge"), so a resource-tagged taxonomy would need constant upkeep
+# against a manifest that's intentionally never enumerated here. Not
+# consumed/routed on anywhere yet -- same "build the field before its
+# consumer exists" precedent as RecentAction, which also isn't exposed over
+# any endpoint yet.
+MessageIntentLabel = Literal[
+    "read_query",
+    "write_action",
+    "workflow_request",
+    "capability_question",
+    "clarification_or_followup",
+    "conversational",
+    "report_request",
+]
+
+
+class _IntentClassification(BaseModel):
+    intent: MessageIntentLabel
+
+
+async def _classify_message_intent(prompt: str) -> MessageIntentLabel | None:
+    """One cheap LLM call, constrained to exactly one of the labels above by
+    with_structured_output() -- enforced by the provider's own
+    structured-output machinery, not just asked for in the prompt text.
+    Returns None on any failure; never raises. Callers must run this as a
+    background task and must not let its failure touch the main turn --
+    same advisory-degrade posture as _update_chat_summary above."""
+    try:
+        model = resolve_model().with_structured_output(_IntentClassification)
+        result = await model.ainvoke(
+            [
+                HumanMessage(
+                    content=(
+                        "Classify the shape of this user message for a compliance/GRC "
+                        "assistant. Pick exactly one category.\n\n"
+                        f"Message: {prompt}"
+                    )
+                )
+            ]
+        )
+        return result.intent
+    except Exception:
+        logger.warning("message intent classification failed", exc_info=True)
+        return None
+
+
+# Mirrors eval/local/scoring.py's `_CYBERSIERRA_COMMAND_PATTERN` — catches a
+# model bypassing `run_execution_plan` and invoking `cybersierra <module>
+# <resource> <action>` directly via a raw shell/`execute` call. Not reachable
+# today (only `run_execution_plan` is bound as a tool below), but kept in
+# lockstep with the local eval track's already-proven extraction logic so a
+# future tool-binding change doesn't silently reopen the same gap that track
+# hit once already.
+_CYBERSIERRA_COMMAND_PATTERN = re.compile(r"\bcybersierra\s+([a-z][\w-]*)\s+([a-z][\w-]*)\s+([a-z][\w-]*)\b")
+
+
+def _extract_plan_commands(plan_json: str | None) -> list[str]:
+    """Best-effort extraction of every step's bare `command` string from a
+    `run_execution_plan` call's `plan_json` argument. A malformed/missing
+    plan contributes no commands rather than raising — a bad plan is a real
+    (if rare) model failure mode, not a reason to crash the turn.
+    """
+    if not plan_json:
+        return []
+    try:
+        plan = json.loads(plan_json)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [step["command"] for step in plan.get("steps", []) if step.get("command")]
+
+
+def _extract_plan_outputs(tool_output: str | None) -> list[str]:
+    """Best-effort extraction of every step's real `stdout` from a
+    `run_execution_plan` call's JSON-encoded return value (see
+    `harness/executor_tool.py`'s `{"result": ..., "executionLog": [...]}`
+    shape — each entry already carries the real per-step `stdout`). Feeds
+    the Netra eval track's Hallucination evaluator, which needs the actual
+    CLI output the final answer must stay grounded in — mirrors
+    `_extract_plan_commands`'s error handling: a malformed/missing payload
+    contributes no outputs rather than raising.
+    """
+    if not tool_output:
+        return []
+    try:
+        payload = json.loads(tool_output)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [entry["stdout"] for entry in payload.get("executionLog", []) if entry.get("stdout")]
+
+
+def _extract_plan_actions(tool_output: str | None) -> list[tuple[str, bool]]:
+    """Best-effort extraction of every step's real `command` and precomputed
+    `success` flag from a `run_execution_plan` call's JSON-encoded return
+    value — same `executionLog` shape `_extract_plan_outputs` above already
+    parses, and the same error-handling convention (a malformed/missing
+    payload contributes nothing rather than raising). Feeds `stream()`'s
+    `RecentAction` ring-buffer entries: one entry per step, since a single
+    `run_execution_plan` call can contain several independently
+    succeeding/failing steps.
+    """
+    if not tool_output:
+        return []
+    try:
+        payload = json.loads(tool_output)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [
+        (entry["command"], bool(entry.get("success")))
+        for entry in payload.get("executionLog", [])
+        if entry.get("command")
+    ]
+
 
 # One checkpointer for the life of this process, shared by every session —
 # this IS the state; server/sessions.py (like the Claude POC's) holds only
-# a session-id -> lock/metadata mapping, never message history. Process-
-# lifetime, in-memory: same deliberate POC-scope choice as the Claude POC's
-# SessionStore, made explicit in README "Known limitations".
-_checkpointer = InMemorySaver()
+# a session-id -> lock/metadata mapping, never message history.
+#
+# Swappable, not a fixed InMemorySaver: server/app.py's lifespan hook calls
+# set_checkpointer() with an AsyncPostgresSaver when DATABASE_URL is
+# configured, making this durable and shared across processes; falls back
+# to this in-memory default otherwise (process-lifetime, lost on restart —
+# same deliberate POC-scope choice as before, now opt-in-out-of rather than
+# fixed). See poc-wiki/incremental-development/ for why this is a single
+# swapped-in checkpointer, not a hot in-memory layer plus a separate backup
+# synced by hand — that design was tried and found to silently corrupt
+# message history (LangGraph's `messages` channel is delta-based; copying
+# only the latest checkpoint's `channel_values` between two independent
+# checkpointer instances drops the ancestor chain delta reconstruction
+# depends on, confirmed live, not guessed). Using one real checkpointer
+# instance throughout — whichever one is active — sidesteps that entirely,
+# since LangGraph's own resume logic already handles it correctly.
+_checkpointer: BaseCheckpointSaver = InMemorySaver()
+
+
+def set_checkpointer(cp: BaseCheckpointSaver) -> None:
+    global _checkpointer
+    _checkpointer = cp
 
 # Passed through to the sandboxed shell backend's subprocess env so
-# `cybersierra`/`npm`/`npx`/`python3` resolve and the CLI's persisted
-# profile (~/.cybersierra/config.json) is found. Nothing else from this
-# process's ambient os.environ crosses into the sandbox — see
+# `cybersierra`/`npm`/`npx`/`python3` resolve. HOME is what makes the CLI's
+# persisted profile (~/.cybersierra/config.json), if one happens to exist,
+# get found -- but a real deployment must not depend on that existing (see
+# MORPHEUS_BASE_URL injection in _build_agent below, which is what makes a
+# host with no persisted profile at all work correctly). Nothing else from
+# this process's ambient os.environ crosses into the sandbox — see
 # harness/sandbox.py and README "Security boundary".
 _PASSTHROUGH_ENV_KEYS = ("PATH", "HOME")
 
@@ -136,16 +411,55 @@ _INJECT_ENV_VAR = "CYBERSIERRA_INJECT_ACCESS_TOKEN"
 # LangGraph's own default (25) was silently in effect here -- neither
 # astream_events() call below passed a recursion_limit at all. Confirmed
 # via logs/harness.log as the exact, literal cause of every
-# "Recursion limit of 25 reached" failure in a dataset/run_dataset.py run:
+# "Recursion limit of 25 reached" failure in a eval/local/runner.py run:
 # several turns were mid-discovery (a wrong guess, then --help, then a
 # validation-error-driven pivot to a filter-options lookup) and simply ran
 # out of graph steps one or two calls before the correct final call. Not a
 # prompt-content fix -- raised so a multi-guess discovery sequence has room
 # to actually converge instead of being cut off near the end.
-GRAPH_RECURSION_LIMIT = 60
+#
+# 60, then 120, both still failed live on one particular query ("list
+# unread notifications" -- see logs/harness.log thread_id=91b62ab5-...),
+# each time after only ~8-9 logged tool calls. That first looked like a
+# fixed per-action middleware-overhead multiplier, but isolated replay at
+# the time (instrumenting graph.astream_events() directly, counting
+# on_chain_start/on_tool_start events) seemed to disprove that, showing
+# ~20 model rounds / ~40 total graph steps for an equivalent prompt --
+# comfortably under 60. Raised to 200 on that basis (a wide margin over an
+# assumed ~2-steps-per-round cost), which is what shipped for a long time.
+#
+# 2026-09-11: that ~2-steps-per-round assumption was wrong, found via real
+# Netra-traced eval runs, not another isolated replay. Every "Recursion
+# limit of 200 reached" failure examined (11 of 25 items in one run, all
+# with concurrency=1 so not a race condition) hit the ceiling at *exactly*
+# 12 "model" graph-node executions every time, regardless of how many or
+# how few real CLI calls happened inside those 12 rounds -- including
+# after fixing the agent's discovery behavior (skills/cyber-sierra/SKILL.md,
+# same date) to use clean `--help`-based lookups instead of hand-rolled,
+# sometimes-buggy `manifest --raw | python3 -c ...` one-liners. The fixed
+# failure point despite materially different, cleaner per-round behavior
+# is what rules out "wasted rounds" as the cause: counting actual span
+# data per round (7 middlewares x abefore_model+aafter_model + 1 model
+# node = 15 steps, confirmed against the real trace's own span timestamps)
+# gives 2 (one-time prologue) + 12*15 + ~15 tool-node steps =~ 197-200 --
+# matching the observed cutoff exactly. So the real cost is ~15-16 steps
+# per model round, not ~2, and 200 only ever bought ~12 real rounds --
+# too few for any query needing more than one or two `--help` lookups plus
+# a data call plus a second resource, which several of these dataset items
+# genuinely do even when the agent behaves efficiently.
+#
+# Recomputed from that measured per-round cost, not guessed: to give ~25-30
+# real model rounds of headroom (25-30 * 16 =~ 450-490), rounded to 500.
+GRAPH_RECURSION_LIMIT = 500
 
 
-def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None = None):
+def _build_agent(
+    access_token: str = "",
+    *,
+    checkpointer: BaseCheckpointSaver | None = None,
+    user_permissions: dict[str, list[str]] | None = None,
+    chat_summary_result: _ChatSummaryResult | None = None,
+):
     """The one place that assembles this harness's DeepAgents graph.
 
     Called fresh on every `run()`/`stream()` call, exactly like the Claude
@@ -158,21 +472,38 @@ def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None =
 
     Whether `access_token` actually becomes this call's cybersierra
     identity is conditional, and that's a deliberate fix, not the original
-    design: setting `CYBERSIERRA_TOKEN` in the subprocess env
-    *unconditionally* — which this did at first — actively breaks the
-    "already logged in via `cybersierra auth login-browser`" convenience
-    this POC otherwise assumes (see README "Authentication model"),
-    because the real CLI checks `process.env.CYBERSIERRA_TOKEN ?? <persisted
-    profile>` — JS's `??` only falls back on `null`/`undefined`, not on a
-    wrong string, so *any* non-empty value here, including a UI placeholder
-    that was never meant to be a real credential, wins over the already-
-    authenticated profile and gets rejected by the real backend. So: by
-    default, `CYBERSIERRA_TOKEN` is simply never added to this env dict,
-    and the persisted profile from the one-time login resolves normally.
-    Set `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` to opt into the other, also-real
-    mechanism this harness supports — per-request token injection,
-    verified in README to override the persisted profile — for anyone
-    actually running a shape-B/C multi-tenant demo with real per-user JWTs.
+    design: setting the override var in the subprocess env *unconditionally*
+    — which this did at first — actively breaks the "already logged in via
+    `cybersierra auth login-browser`" convenience this POC otherwise assumes
+    (see README "Authentication model"), because the real CLI checks
+    `process.env.MORPHEUS_TOKEN ?? <persisted profile>.token` — JS's `??`
+    only falls back on `null`/`undefined`, not on a wrong string, so *any*
+    non-empty value here, including a UI placeholder that was never meant to
+    be a real credential, wins over the already-authenticated profile and
+    gets rejected by the real backend. So: by default, `MORPHEUS_TOKEN` is
+    simply never added to this env dict, and the persisted profile from the
+    one-time login resolves normally. Set `CYBERSIERRA_INJECT_ACCESS_TOKEN=1`
+    to opt into the other, also-real mechanism this harness supports —
+    per-request token injection, confirmed live against the actual installed
+    CLI binary (see harness/sandbox.py's `MORPHEUS_TOKEN` usage below) — for
+    anyone actually running a shape-B/C multi-tenant demo with real per-user
+    JWTs.
+
+    Correction, not the original design either: earlier versions of this
+    harness (and this repo's README/ARCHITECTURE.md, not yet corrected as of
+    this comment) injected `CYBERSIERRA_TOKEN`, believing that was the CLI's
+    override variable. It isn't — grepping the actual installed
+    `~/.cybersierra/bin/cybersierra` binary shows zero references to
+    `CYBERSIERRA_TOKEN` anywhere in it; the real variable, confirmed both by
+    reading the binary's profile-resolution code and by reproducing live
+    (`MORPHEUS_TOKEN=<garbage> cybersierra auth whoami` gets a real "Invalid
+    token" rejection from the backend; `CYBERSIERRA_TOKEN=<garbage>` against
+    the same command is silently ignored, identical to setting nothing), is
+    `MORPHEUS_TOKEN`. This means `CYBERSIERRA_INJECT_ACCESS_TOKEN=1` was a
+    silent no-op in every prior version of this code — every request kept
+    using the persisted profile regardless of which per-request token was
+    sent. README "Authentication model" needs a correction pass; this
+    docstring and the actual injection below are already fixed.
 
     `access_token` itself is optional now, not required (see
     `server/app.py` and README "Authentication model" — the `no_token` 400
@@ -180,15 +511,60 @@ def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None =
     `~/.cybersierra/config.json` from that one-time login, so there is no
     per-request credential this POC needs to enforce. The `access_token and`
     guard below matters specifically when `CYBERSIERRA_INJECT_ACCESS_TOKEN=1`
-    is set but a caller sends no token: without it, `CYBERSIERRA_TOKEN`
+    is set but a caller sends no token: without it, `MORPHEUS_TOKEN`
     would be set to `""`, which the CLI's `??` fallback treats as a real
     (empty, rejected) value rather than "absent" — silently breaking the
     persisted-profile fallback the same way the original unconditional-
     injection bug did.
     """
     env = {key: os.environ[key] for key in _PASSTHROUGH_ENV_KEYS if key in os.environ}
+
+    # Deployment-wide, not per-request -- unlike MORPHEUS_TOKEN below, this
+    # has nothing to do with which user is calling, so it is never gated by
+    # CYBERSIERRA_INJECT_ACCESS_TOKEN. Read from CYBERSIERRA_BASE_URL (this
+    # repo's own .env.example) and translated into MORPHEUS_BASE_URL -- the
+    # name the real CLI's profile resolution actually reads
+    # (`process.env.MORPHEUS_BASE_URL ?? persistedProfile.baseUrl`), same
+    # translated-injection shape as MORPHEUS_TOKEN just below, mirrored on
+    # purpose. Unconditional so a genuinely fresh deployment host -- one
+    # that has NEVER had a human run `cybersierra auth login-browser` on
+    # it, and so has no ~/.cybersierra/config.json at all -- still resolves
+    # a baseUrl on every single CLI call, instead of silently depending on
+    # a persisted profile nobody guaranteed exists (confirmed live: an
+    # empty/absent profile with no override here fails every command with
+    # "No baseUrl configured", regardless of how correct MORPHEUS_TOKEN is).
+    # `if base_url:` (truthy), not `is not None` -- an empty string here
+    # would be read by the CLI's `??` as a present-but-wrong value, the
+    # same class of bug already found and fixed for MORPHEUS_TOKEN above.
+    # Leaving CYBERSIERRA_BASE_URL unset (as today, by default) preserves
+    # the bundled frontend/index.html local-dev path, which intentionally
+    # still depends on a persisted profile for single-developer testing.
+    base_url = os.environ.get("CYBERSIERRA_BASE_URL")
+    if base_url:
+        env["MORPHEUS_BASE_URL"] = base_url
+    elif os.environ.get(_INJECT_ENV_VAR):
+        logger.warning(
+            "cybersierra_base_url_missing "
+            "CYBERSIERRA_INJECT_ACCESS_TOKEN is set but CYBERSIERRA_BASE_URL is not -- "
+            "every CLI call on a host with no persisted profile will fail with "
+            "'No baseUrl configured'",
+            extra={"event": "cybersierra_base_url_missing"},
+        )
+
     if access_token and os.environ.get(_INJECT_ENV_VAR):
-        env["CYBERSIERRA_TOKEN"] = access_token
+        # MORPHEUS_TOKEN, not CYBERSIERRA_TOKEN -- confirmed by reading the
+        # actual installed CLI binary's profile-resolution code directly
+        # (~/.cybersierra/bin/cybersierra) and reproducing live:
+        # MORPHEUS_TOKEN=<garbage> against `cybersierra auth whoami` gets a
+        # real "Invalid token" rejection from the backend (proves it's read
+        # and would work with a real token); CYBERSIERRA_TOKEN=<garbage>
+        # against the same command is silently ignored and resolves to the
+        # persisted profile instead -- identical output to setting nothing
+        # at all. This repo's docs previously claimed the opposite (see
+        # README "Authentication model" -- that section is now stale and
+        # needs correcting); this was never actually true against a real
+        # CLI install.
+        env["MORPHEUS_TOKEN"] = access_token
 
     backend = AllowlistedShellBackend(
         root_dir=str(PROJECT_ROOT),
@@ -198,11 +574,16 @@ def _build_agent(access_token: str = "", *, checkpointer: InMemorySaver | None =
         redact=access_token,  # scrub from cli_call_* log lines only, see harness/sandbox.py
     )
 
+    # Fresh throwaway box when the caller doesn't track this (e.g. run(),
+    # which has no session concept at all) -- the middleware still works
+    # correctly, its result box just has nothing to read it afterward.
+    chat_summary_result = chat_summary_result or _ChatSummaryResult("", 0)
+
     return create_deep_agent(
         model=resolve_model(),
-        system_prompt=SYSTEM_PROMPT_APPENDIX,
+        system_prompt=SYSTEM_PROMPT_APPENDIX + _render_user_permissions(user_permissions),
         tools=[make_run_execution_plan_tool(backend)],
-        middleware=[ShellSandboxMiddleware(redact=access_token)],
+        middleware=[ShellSandboxMiddleware(redact=access_token), _BoundedContextMiddleware(chat_summary_result)],
         skills=[str(SKILLS_ROOT)],
         backend=backend,
         checkpointer=checkpointer if checkpointer is not None else _checkpointer,
@@ -237,6 +618,40 @@ async def _log_skills_available(graph: Any, config: dict, access_token: str) -> 
         )
 
 
+class _LlmCallTracker:
+    """Marks each individual model round-trip within a turn — `turn_start`/
+    `turn_done` only bracket the WHOLE multi-round turn, which can include
+    several LLM calls interleaved with several tool calls, and there was no
+    log event for an individual LLM call boundary at all before this. Feeds
+    harness/console_format.py's "🧠 LLM" story beat (and its per-turn call
+    count); the file log gets these as ordinary `llm_call_start`/
+    `llm_call_end` lines like any other event.
+
+    Keyed by the event's own `run_id` rather than a single "last start"
+    variable: LangGraph's ReAct-style loop only ever runs one model call at
+    a time in this harness today, so a single variable would work too, but
+    keying by `run_id` costs almost nothing and stays correct even if that
+    ever changes.
+    """
+
+    def __init__(self) -> None:
+        self._starts: dict[str, float] = {}
+
+    def observe(self, event: dict[str, Any]) -> None:
+        kind = event["event"]
+        if kind == "on_chat_model_start":
+            self._starts[str(event.get("run_id"))] = time.monotonic()
+            logger.info("llm_call_start", extra={"event": "llm_call_start"})
+        elif kind == "on_chat_model_end":
+            start = self._starts.pop(str(event.get("run_id")), None)
+            elapsed_ms = round((time.monotonic() - start) * 1000) if start is not None else None
+            logger.info(
+                "llm_call_end elapsed_ms=%s",
+                elapsed_ms,
+                extra={"event": "llm_call_end", "elapsed_ms": elapsed_ms},
+            )
+
+
 async def run(prompt: str, access_token: str = "") -> str:
     """Run one turn of the agent for one caller and return only its final
     text. Mirrors the Claude POC's `run()` in shape (single-shot, final-
@@ -262,27 +677,92 @@ async def run(prompt: str, access_token: str = "") -> str:
     )
 
     final_text = ""
-    async for event in graph.astream_events(
-        {"messages": [HumanMessage(content=prompt)]}, config, version="v2"
-    ):
-        if event["event"] == "on_chat_model_end":
-            message = event["data"]["output"]
-            text = _extract_text(message)
-            if text:
-                final_text = text
+    llm_tracker = _LlmCallTracker()
+    actual_commands_seen: list[str] = []
+    actual_outputs_seen: list[str] = []
+    with Netra.start_span("Agent_Turn", as_type=SpanType.TOOL, module_name="agent") as span:
+        span.set_attribute("agent.thread_id", thread_id)
+        Netra.set_session_id(thread_id)
+        if trace_content_enabled():
+            # The dashboard's dedicated Input/Output fields, not a generic
+            # span attribute — resolves against whatever is currently the
+            # root of this trace (see harness/tracing.py's trace_content_enabled
+            # docstring for why this needs its own gate independent of
+            # Netra.init()'s own trace_content setting).
+            Netra.set_root_input(scrub(prompt, access_token))
+        try:
+            async for event in graph.astream_events(
+                {"messages": [HumanMessage(content=prompt)]}, config, version="v2"
+            ):
+                llm_tracker.observe(event)
+                if event["event"] == "on_chat_model_end":
+                    message = event["data"]["output"]
+                    text = _extract_text(message)
+                    if text:
+                        final_text = text
+                elif event["event"] == "on_tool_start":
+                    tool_input = event["data"].get("input") or {}
+                    if event["name"] == "run_execution_plan":
+                        actual_commands_seen += _extract_plan_commands(tool_input.get("plan_json"))
+                    elif event["name"] == "execute":
+                        shell_command = tool_input.get("command")
+                        if isinstance(shell_command, str):
+                            match = _CYBERSIERRA_COMMAND_PATTERN.search(shell_command)
+                            if match:
+                                actual_commands_seen.append(" ".join(match.groups()))
+                elif event["event"] == "on_tool_end" and event["name"] in ("run_execution_plan", "execute"):
+                    # The counterpart to the on_tool_start branch above: reads
+                    # the tool's actual return value (real output), not its
+                    # planned input, into agent.actual_outputs below — the
+                    # grounding context the Netra eval track's Hallucination
+                    # evaluator checks the final answer against. In practice
+                    # the model calls `execute` directly (confirmed live via a
+                    # debug trace — not `run_execution_plan`, despite an
+                    # earlier comment assuming otherwise); `execute`'s
+                    # ToolMessage.content is already the raw CLI output text,
+                    # no JSON envelope to parse. `run_execution_plan` (if ever
+                    # actually used) returns the JSON-encoded executionLog
+                    # shape `_extract_plan_outputs` parses instead.
+                    tool_output = event["data"].get("output")
+                    output_text = getattr(tool_output, "content", tool_output)
+                    if isinstance(output_text, str):
+                        if event["name"] == "run_execution_plan":
+                            actual_outputs_seen += _extract_plan_outputs(output_text)
+                        else:
+                            actual_outputs_seen.append(output_text)
 
-    # Only meaningful AFTER the graph has actually run at least once on
-    # this thread: SkillsMiddleware populates `skills_metadata` via its
-    # `before_agent` hook during execution, not at graph-construction time
-    # — calling this before the loop above logged an empty list every
-    # time (caught by testing, not assumed; see README "Proper logging").
-    await _log_skills_available(graph, config, access_token)
+            # Only meaningful AFTER the graph has actually run at least once on
+            # this thread: SkillsMiddleware populates `skills_metadata` via its
+            # `before_agent` hook during execution, not at graph-construction time
+            # — calling this before the loop above logged an empty list every
+            # time (caught by testing, not assumed; see README "Proper logging").
+            await _log_skills_available(graph, config, access_token)
 
-    logger.info(
-        "turn_done thread_id=%s",
-        thread_id,
-        extra={"event": "turn_done", "thread_id": thread_id},
-    )
+            logger.info(
+                "turn_done thread_id=%s actual_commands=%r",
+                thread_id,
+                actual_commands_seen,
+                extra={"event": "turn_done", "thread_id": thread_id, "actual_commands": actual_commands_seen},
+            )
+            if trace_content_enabled():
+                Netra.set_root_output(scrub(final_text, access_token))
+            # Raw list[str], not json.dumps-encoded — see the identical attribute
+            # in stream() below for why (Netra expression mapping reads this as
+            # an array variable directly). This is the signal the Netra eval
+            # track's Tool Correctness evaluator reads via
+            # spans[?name=='Agent_Turn'] | [0].agent.actual_commands.
+            span.set_attribute("agent.actual_commands", actual_commands_seen)
+            # Same raw list[str] convention as agent.actual_commands, but real
+            # executed stdout instead of planned commands — the Netra eval
+            # track's Hallucination evaluator reads this as retrieved_context via
+            # spans[?name=='Agent_Turn'] | [0].agent.actual_outputs.
+            span.set_attribute("agent.actual_outputs", actual_outputs_seen)
+            span.set_attribute("agent.status", "success")
+            span.set_success()
+        except Exception as exc:  # noqa: BLE001 — re-raised unchanged, span is observability only
+            span.set_attribute("agent.status", "failed")
+            span.set_error(str(exc))
+            raise
     return final_text
 
 
@@ -297,6 +777,23 @@ class TextDelta:
 @dataclass
 class ToolUseStarted:
     name: str
+    args: dict[str, Any] | None = None
+
+
+@dataclass
+class RecentAction:
+    """One real CLI-shaped action (`execute`/`run_execution_plan` step, not
+    DeepAgents-internal tool noise like `read_file`) and whether it
+    succeeded — accumulated per turn in `stream()`'s event loop, then
+    carried home on `Done` for `server/app.py` to fold into that session's
+    `SessionEntry.recent_actions` ring buffer. See `poc-wiki/
+    incremental-development/` for why: reporting "what already succeeded"
+    when a multi-step plan halts partway through.
+    """
+
+    action: str
+    success: bool
+    timestamp: float
 
 
 @dataclass
@@ -306,6 +803,17 @@ class Done:
     total_cost_usd: float | None
     usage: dict[str, Any] | None
     num_turns: int | None
+    recent_actions: list[RecentAction]
+    # None when the chat summary didn't change this turn (short session, or
+    # regeneration failed and the previous one was kept as-is) -- the caller
+    # (server/app.py) should leave SessionEntry.chat_summary/
+    # chat_summary_covers_turns untouched in that case, not overwrite with
+    # a stale/duplicate value.
+    chat_summary: str | None = None
+    chat_summary_covers_turns: int | None = None
+    # None when classification failed/timed out -- not a valid label, the
+    # caller should treat this turn as unclassified, not retry or guess.
+    intent: MessageIntentLabel | None = None
 
 
 @dataclass
@@ -342,6 +850,9 @@ async def stream(
     *,
     session_id: str | None = None,
     resume: str | None = None,
+    user_permissions: dict[str, list[str]] | None = None,
+    chat_summary: str = "",
+    chat_summary_covers_turns: int = 0,
 ) -> AsyncIterator[HarnessEvent]:
     """Run one turn, yielding incremental events as they arrive.
 
@@ -365,6 +876,12 @@ async def stream(
     if not thread_id:
         raise ValueError("exactly one of session_id or resume is required")
 
+    # Fired as early as possible so it runs *concurrently* with everything
+    # below (the graph run is typically many seconds; this is one small
+    # LLM call) -- awaited, with a timeout, only once we're already
+    # assembling Done. Never blocks turn start, never blocks the response.
+    intent_task = asyncio.create_task(_classify_message_intent(prompt))
+
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": GRAPH_RECURSION_LIMIT}
 
     logger.info(
@@ -383,60 +900,206 @@ async def stream(
     num_turns = 0
     usage_totals: dict[str, int] = {}
     tool_calls_seen: list[str] = []
+    actual_commands_seen: list[str] = []
+    actual_outputs_seen: list[str] = []
+    recent_actions: list[RecentAction] = []
+    llm_tracker = _LlmCallTracker()
+    final_text = ""
+    chat_summary_result = _ChatSummaryResult(chat_summary, chat_summary_covers_turns)
 
     try:
-        graph = _build_agent(access_token)
+        graph = _build_agent(access_token, user_permissions=user_permissions, chat_summary_result=chat_summary_result)
 
-        async for event in graph.astream_events(
-            {"messages": [HumanMessage(content=prompt)]}, config, version="v2"
-        ):
-            kind = event["event"]
-            if kind == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                text = _extract_text(chunk)
-                if text:
-                    yield TextDelta(text)
-            elif kind == "on_tool_start":
-                tool_calls_seen.append(event["name"])
-                yield ToolUseStarted(event["name"])
-            elif kind == "on_chat_model_end":
-                num_turns += 1
-                message = event["data"]["output"]
-                for key, value in (getattr(message, "usage_metadata", None) or {}).items():
-                    if isinstance(value, int):
-                        usage_totals[key] = usage_totals.get(key, 0) + value
+        with Netra.start_span("Agent_Turn", as_type=SpanType.TOOL, module_name="agent") as span:
+            span.set_attribute("agent.thread_id", thread_id)
+            span.set_attribute("agent.is_new_session", str(session_id is not None))
+            Netra.set_session_id(thread_id)
+            if trace_content_enabled():
+                Netra.set_root_input(scrub(prompt, access_token))
+            try:
+                async for event in graph.astream_events(
+                    {"messages": [HumanMessage(content=prompt)]}, config, version="v2"
+                ):
+                    llm_tracker.observe(event)
+                    kind = event["event"]
+                    if kind == "on_chat_model_stream":
+                        chunk = event["data"]["chunk"]
+                        text = _extract_text(chunk)
+                        if text:
+                            yield TextDelta(text)
+                    elif kind == "on_tool_start":
+                        tool_calls_seen.append(event["name"])
+                        tool_input = event["data"].get("input") or {}
+                        if event["name"] == "run_execution_plan":
+                            actual_commands_seen += _extract_plan_commands(tool_input.get("plan_json"))
+                        elif event["name"] == "execute":
+                            shell_command = tool_input.get("command")
+                            if isinstance(shell_command, str):
+                                match = _CYBERSIERRA_COMMAND_PATTERN.search(shell_command)
+                                if match:
+                                    actual_commands_seen.append(" ".join(match.groups()))
+                        yield ToolUseStarted(event["name"], event["data"].get("input"))
+                    elif kind == "on_tool_end" and event["name"] in ("run_execution_plan", "execute"):
+                        # Counterpart to the on_tool_start branch above: reads
+                        # the tool's actual return value (real output), not
+                        # its planned input — feeds agent.actual_outputs
+                        # below, the grounding context the Netra eval track's
+                        # Hallucination evaluator checks the final answer
+                        # against. In practice the model calls `execute`
+                        # directly (confirmed live — not `run_execution_plan`,
+                        # despite an earlier comment assuming otherwise);
+                        # `execute`'s ToolMessage.content is already the raw
+                        # CLI output text, no JSON envelope to parse.
+                        tool_output = event["data"].get("output")
+                        output_text = getattr(tool_output, "content", tool_output)
+                        if isinstance(output_text, str):
+                            if event["name"] == "run_execution_plan":
+                                actual_outputs_seen += _extract_plan_outputs(output_text)
+                            else:
+                                actual_outputs_seen.append(output_text)
+                    elif kind == "on_chain_end" and event.get("name") == "tools":
+                        # The RecentAction signal source — deliberately NOT
+                        # on_tool_start/on_tool_end above. Confirmed live
+                        # (not assumed): when ShellSandboxMiddleware denies a
+                        # command, it short-circuits before the `execute`
+                        # tool's own traced Runnable ever runs, so
+                        # on_tool_start/on_tool_end/on_tool_error never fire
+                        # for a denied call at all — only this chain-level
+                        # "tools" node event does, for both denied AND
+                        # actually-executed calls alike. Its `data["input"]`
+                        # is the batch of requested tool_calls (with `id`);
+                        # `data["output"]["messages"]` is the resulting
+                        # ToolMessages, correlated by `tool_call_id`.
+                        chain_data = event.get("data") or {}
+                        requested = {
+                            tc["id"]: tc for tc in (chain_data.get("input") or []) if tc.get("id")
+                        }
+                        for tool_message in (chain_data.get("output") or {}).get("messages") or []:
+                            tool_call = requested.get(getattr(tool_message, "tool_call_id", None))
+                            if tool_call is None or tool_call.get("name") not in ("run_execution_plan", "execute"):
+                                continue
+                            if tool_call["name"] == "run_execution_plan":
+                                # One RecentAction per plan step, not one for
+                                # the whole call — a single result here can
+                                # represent several independently
+                                # succeeding/failing steps; collapsing to one
+                                # entry would lose exactly the "which steps
+                                # already succeeded" signal this exists for.
+                                plan_output = getattr(tool_message, "content", None)
+                                if isinstance(plan_output, str):
+                                    for command, success in _extract_plan_actions(plan_output):
+                                        recent_actions.append(RecentAction(command, success, time.time()))
+                                continue
+                            shell_command = (tool_call.get("args") or {}).get("command")
+                            if not isinstance(shell_command, str):
+                                continue
+                            match = _CYBERSIERRA_COMMAND_PATTERN.search(shell_command)
+                            if not match:
+                                continue
+                            if getattr(tool_message, "status", None) == "error":
+                                # Covers both a sandbox denial (this
+                                # ToolMessage never carries an `exit_code`
+                                # artifact at all, since the backend was
+                                # never reached) and a tool-level error
+                                # status for any other reason.
+                                success = False
+                            else:
+                                # A real, executed call: read the structured
+                                # {"exit_code": N} artifact (deepagents'
+                                # _execute_artifact) rather than text-sniffing
+                                # the human-readable output.
+                                artifact = getattr(tool_message, "artifact", None)
+                                exit_code = artifact.get("exit_code") if isinstance(artifact, dict) else None
+                                success = exit_code == 0
+                            recent_actions.append(RecentAction(" ".join(match.groups()), success, time.time()))
+                    elif kind == "on_chat_model_end":
+                        num_turns += 1
+                        message = event["data"]["output"]
+                        text = _extract_text(message)
+                        if text:
+                            final_text = text
+                        for key, value in (getattr(message, "usage_metadata", None) or {}).items():
+                            if isinstance(value, int):
+                                usage_totals[key] = usage_totals.get(key, 0) + value
 
-        # After the run, not before — see the identical comment in run()
-        # for why this ordering matters (before_agent hasn't populated
-        # skills_metadata until the graph has actually executed once).
-        await _log_skills_available(graph, config, access_token)
+                # After the run, not before — see the identical comment in run()
+                # for why this ordering matters (before_agent hasn't populated
+                # skills_metadata until the graph has actually executed once).
+                await _log_skills_available(graph, config, access_token)
 
-        logger.info(
-            "turn_done thread_id=%s num_turns=%d tool_calls=%r usage=%r",
-            thread_id,
-            num_turns,
-            tool_calls_seen,
-            usage_totals,
-            extra={
-                "event": "turn_done",
-                "thread_id": thread_id,
-                "num_turns": num_turns,
-                "tool_calls": tool_calls_seen,
-                "usage": usage_totals,
-            },
-        )
-        yield Done(
-            session_id=thread_id,
-            subtype="success",
-            # LangChain/DeepAgents does not compute a dollar cost the way
-            # the Claude SDK's ResultMessage does (that's Anthropic-specific
-            # pricing knowledge baked into the SDK) — always None here, by
-            # design, not a bug. See README "SSE contract: shape vs content".
-            total_cost_usd=None,
-            usage=usage_totals or None,
-            num_turns=num_turns or None,
-        )
+                # By now the graph has already run for however many seconds
+                # that took -- classification (one small LLM call, started
+                # at turn start) has almost always already finished. The
+                # timeout is a backstop, not the expected path.
+                try:
+                    intent = await asyncio.wait_for(intent_task, timeout=5.0)
+                except Exception:
+                    logger.warning("message intent classification timed out or failed", exc_info=True)
+                    intent = None
+
+                logger.info(
+                    "turn_done thread_id=%s num_turns=%d tool_calls=%r usage=%r actual_commands=%r intent=%s",
+                    thread_id,
+                    num_turns,
+                    tool_calls_seen,
+                    usage_totals,
+                    actual_commands_seen,
+                    intent,
+                    extra={
+                        "event": "turn_done",
+                        "thread_id": thread_id,
+                        "num_turns": num_turns,
+                        "tool_calls": tool_calls_seen,
+                        "usage": usage_totals,
+                        "actual_commands": actual_commands_seen,
+                        "intent": intent,
+                    },
+                )
+                span.set_attribute("agent.num_turns", str(num_turns))
+                span.set_attribute("agent.tool_calls", json.dumps(tool_calls_seen))
+                span.set_attribute("agent.usage", json.dumps(usage_totals))
+                # Raw list[str], not json.dumps-encoded like the attributes
+                # above — deliberately, so Netra's eval expression mapping
+                # (eval/netra/EVALUATOR_SETUP.md) can read this as an array
+                # variable without needing a JSON-string parse step. This is
+                # the single unambiguous "what did the agent actually invoke"
+                # signal for the Netra eval track, mirroring
+                # eval/local/scoring.py's extract_actual_commands().
+                span.set_attribute("agent.actual_commands", actual_commands_seen)
+                # Same raw list[str] convention, but real executed stdout
+                # instead of planned commands — the Hallucination evaluator's
+                # retrieved_context, mapped via spans[?name=='Agent_Turn'] |
+                # [0].agent.actual_outputs.
+                span.set_attribute("agent.actual_outputs", actual_outputs_seen)
+                if trace_content_enabled():
+                    Netra.set_root_output(scrub(final_text, access_token))
+                span.set_attribute("agent.status", "success")
+                span.set_success()
+                yield Done(
+                    session_id=thread_id,
+                    subtype="success",
+                    # LangChain/DeepAgents does not compute a dollar cost the way
+                    # the Claude SDK's ResultMessage does (that's Anthropic-specific
+                    # pricing knowledge baked into the SDK) — always None here, by
+                    # design, not a bug. See README "SSE contract: shape vs content".
+                    total_cost_usd=None,
+                    usage=usage_totals or None,
+                    num_turns=num_turns or None,
+                    recent_actions=recent_actions,
+                    chat_summary=chat_summary_result.summary if chat_summary_result.changed else None,
+                    chat_summary_covers_turns=chat_summary_result.covers_turns if chat_summary_result.changed else None,
+                    intent=intent,
+                )
+            except Exception as exc:  # noqa: BLE001 — mirrors the outer handler below
+                span.set_attribute("agent.status", "failed")
+                span.set_error(str(exc))
+                raise
     except Exception as exc:  # noqa: BLE001 — deliberately broad, see Claude POC's ClaudeSDKError handling
+        # Explicit cancel, not left to GC: an asyncio.Task nothing ever
+        # awaits/cancels can log an "exception was never retrieved" warning
+        # if it also failed -- the turn already failed here regardless of
+        # what classification was doing, so its result is moot either way.
+        intent_task.cancel()
         logger.exception("harness_error thread_id=%s", thread_id, extra={"event": "harness_error", "thread_id": thread_id})
         yield Failed("harness_error", str(exc))
 
@@ -448,9 +1111,11 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
 
     from harness.observability import configure_logging
+    from harness.tracing import init_tracing
 
     load_dotenv(override=False)
     configure_logging()
+    init_tracing()
 
     demo_token = os.environ.get("CYBERSIERRA_DEMO_TOKEN", "placeholder-token-not-real")
     demo_prompt = sys.argv[1] if len(sys.argv) > 1 else "Who are you and what can you help me with?"
